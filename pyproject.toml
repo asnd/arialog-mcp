@@ -1,0 +1,55 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "arialog-mcp"
+version = "0.1.0"
+description = "Read-only MCP server for VMware Aria Operations for Logs (vRealize Log Insight) 8.18.x"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+dependencies = [
+    "fastmcp==4.0.11",
+    "httpx>=0.27",
+    "pydantic>=2.6",
+    "pydantic-settings>=2.2",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+    "pytest-cov>=5.0",
+    "ruff>=0.4",
+    "mypy>=1.9",
+]
+
+[project.scripts]
+arialog-mcp = "arialog_mcp.__main__:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/arialog_mcp"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+pythonpath = ["src", "tests/stubs"]
+filterwarnings = ["ignore::DeprecationWarning:fastmcp.*"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "W", "SIM"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["arialog_mcp", "vrli_stub", "conftest"]
+
+[tool.mypy]
+python_version = "3.11"
+packages = ["arialog_mcp"]
+ignore_missing_imports = true
+strict = false
+check_untyped_defs = true

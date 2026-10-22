@@ -1,0 +1,9 @@
+# Build: podman build --format docker -t localhost/vrli-stub:dev tests/stubs
+FROM docker.io/library/python:3.12-slim
+RUN pip install --no-cache-dir starlette==1.7.0 uvicorn==0.54.0
+WORKDIR /stub
+COPY vrli_stub ./vrli_stub
+EXPOSE 9543
+HEALTHCHECK --interval=5s --timeout=3s --retries=10 \
+  CMD ["python", "-c", "import urllib.request as u; u.build_opener(u.ProxyHandler({})).open('http://127.0.0.1:9543/api/v1/version', timeout=2)"]
+CMD ["uvicorn", "vrli_stub.app:app", "--host", "0.0.0.0", "--port", "9543"]
