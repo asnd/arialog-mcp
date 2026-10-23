@@ -3,7 +3,8 @@
 Mimics the documented behaviour that matters to clients:
 * constraints live in the URL path (``field/<OP value>``), values percent-encoded;
 * a query WITHOUT a timestamp constraint only covers the last minute;
-* bearer sessions with a TTL.
+* bearer sessions with a TTL, one per user (STUB_USERS={"user": "pass", ...} adds users
+  next to STUB_USER/STUB_PASS; /_stub/stats counts requests per VRLI user).
 
 Fault injection (POST /_stub/faults, DELETE to reset) lets tests exercise failure paths.
 The payload shapes follow the public API docs; they are NOT verified against a real 8.18
@@ -12,6 +13,7 @@ appliance — see ARCHITECTURE.md open items.
 
 from __future__ import annotations
 
+import json
 import os
 import re
 import secrets
@@ -102,13 +104,15 @@ def create_app(
     now_fn: Callable[[], int] | None = None,
     username: str | None = None,
     password: str | None = None,
+    users: dict[str, str] | None = None,
 ) -> Starlette:
     anchor = anchor_ms if anchor_ms is not None else int(time.time() * 1000)
     now = now_fn or (lambda: anchor)
     user = username or os.environ.get("STUB_USER", "svc-test")
     pwd = password or os.environ.get("STUB_PASS", "placeholder")
+    accounts = {user: pwd, **json.loads(os.environ.get("STUB_USERS", "{}")), **(users or {})}
     dataset = make_dataset(anchor)
-    sessions: dict[str, float] = {}
+    sessions: dict[str, tuple[float, str]] = {}
     state: dict[str, Any] = {}
 
     def reset() -> None:
@@ -122,6 +126,8 @@ def create_app(
             request_count=0,
             login_failures=0,
             ttl=1800,
+            requests_by_user={},
+            logins_by_user={},
         )
 
     reset()
@@ -189,8 +195,11 @@ def create_app(
             return JSONResponse({"errorMessage": "Service starting"}, status_code=503)
         if auth:
             token = request.headers.get("authorization", "").removeprefix("Bearer ").strip()
-            if sessions.get(token, 0) < time.monotonic():
+            expiry, who = sessions.get(token, (0.0, ""))
+            if expiry < time.monotonic():
                 return JSONResponse({"errorMessage": "Invalid session"}, status_code=401)
+            by_user = state["requests_by_user"]
+            by_user[who] = by_user.get(who, 0) + 1
         return None
 
     async def login(request: Request) -> Response:
@@ -199,15 +208,17 @@ def create_app(
             return JSONResponse({"errorMessage": "Service starting"}, status_code=503)
         body = await request.json()
         state["login_count"] += 1
+        who = str(body.get("username"))
         if (
-            body.get("username") != user
-            or body.get("password") != pwd
+            who not in accounts
+            or body.get("password") != accounts[who]
             or body.get("provider") not in ("Local", "ActiveDirectory", "vIDM")
         ):
             state["login_failures"] += 1
             return JSONResponse({"errorMessage": "Invalid credentials"}, status_code=401)
+        state["logins_by_user"][who] = state["logins_by_user"].get(who, 0) + 1
         token = secrets.token_hex(16)
-        sessions[token] = time.monotonic() + state["ttl"]
+        sessions[token] = (time.monotonic() + state["ttl"], who)
         return JSONResponse({"userId": "u-1", "sessionId": token, "ttl": state["ttl"]})
 
     def body_or_bad_json(payload: dict[str, Any]) -> Response:
@@ -267,7 +278,16 @@ def create_app(
 
     async def stats(_: Request) -> Response:
         return JSONResponse(
-            {k: state[k] for k in ("login_count", "login_failures", "request_count")}
+            {
+                k: state[k]
+                for k in (
+                    "login_count",
+                    "login_failures",
+                    "request_count",
+                    "requests_by_user",
+                    "logins_by_user",
+                )
+            }
             | {"anchor_ms": anchor}
         )
 

@@ -110,4 +110,4 @@ Resolved (2026-10-07):
 
 Open:
 - Verify 8.18 API surface (`aggregated-events`, alert endpoints, any grouping endpoint) against a real appliance; signature grouping stays client-side until confirmed.
-- Phase 1 limits: `log_fields`, `alert_list/get` and group-by aggregation are not built yet (need real-appliance response shapes). HTTP transport has no auth yet (phase 5). Run `scripts/e2e.sh` for the hermetic Podman test; unit tests: `NO_PROXY=127.0.0.1,localhost uv run pytest`.
+- Phase 1 limits: `log_fields`, `alert_list/get` and group-by aggregation are not built yet (need real-appliance response shapes). HTTP transport: `ARIALOG_HTTP_AUTH_MODE` = `token` (shared bearer) or `ldap` (HTTP Basic + LDAPS bind, ariaops-mcp-compatible group map, per-user VRLI passthrough); one of them is mandatory on non-loopback binds. OAuth remains open. Run `scripts/e2e.sh` for the hermetic Podman test; unit tests: `NO_PROXY=127.0.0.1,localhost uv run pytest`.

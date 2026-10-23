@@ -2,27 +2,39 @@
 
 from __future__ import annotations
 
+import functools
+import hmac
 import json
 import logging
 import time
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
-from typing import Annotated, Any
+from typing import Annotated, Any, ParamSpec, TypeVar
 
 from fastmcp import FastMCP
 from fastmcp.exceptions import ToolError
 from fastmcp.exceptions import ValidationError as McpValidationError
+from fastmcp.server.auth import AccessToken, AuthProvider, TokenVerifier
+from fastmcp.server.dependencies import get_access_token
 from fastmcp.server.middleware import Middleware, MiddlewareContext
-from pydantic import Field, ValidationError
+from pydantic import Field, SecretStr, ValidationError
 from starlette.requests import Request
 from starlette.responses import PlainTextResponse
 
 from . import __version__
-from .client import VRLIClient
+from .client import Credentials, VRLIClient
 from .config import Settings
-from .constraints import Filter, Window, build_constraints, resolve_window
-from .errors import ArialogError
+from .constraints import (
+    MAX_FILTERS,
+    MAX_TEXT_TERMS,
+    Filter,
+    Window,
+    build_constraints,
+    resolve_window,
+)
+from .errors import ArialogError, AuthError
+from .ldap_auth import LDAPAuthenticator, LDAPBasicAuth, UserAccessToken
 from .models import (
     AggregateResult,
     Bin,
@@ -53,11 +65,60 @@ Start = Annotated[
 ]
 End = Annotated[str | None, Field(description="Window end (default: now); needs start")]
 TextTerms = Annotated[
-    list[str] | None, Field(description="Message must contain ALL of these terms (max 10)")
+    list[str] | None,
+    Field(
+        max_length=MAX_TEXT_TERMS,
+        description=f"Message must contain ALL of these terms (max {MAX_TEXT_TERMS})",
+    ),
 ]
-Filters = Annotated[list[Filter] | None, Field(description="Field constraints, e.g. hostname")]
+Filters = Annotated[
+    list[Filter] | None,
+    Field(
+        max_length=MAX_FILTERS,
+        description=f"Field constraints, e.g. hostname (max {MAX_FILTERS})",
+    ),
+]
 
 READ_ONLY = {"readOnlyHint": True, "destructiveHint": False, "openWorldHint": False}
+
+P = ParamSpec("P")
+R = TypeVar("R")
+
+
+def domain_errors(fn: Callable[P, Awaitable[R]]) -> Callable[P, Awaitable[R]]:
+    """Surface domain errors (written to be LLM-safe) as tool errors.
+
+    The server masks every other exception, so internals never reach the client.
+    """
+
+    @functools.wraps(fn)
+    async def wrapper(*args: P.args, **kwargs: P.kwargs) -> R:
+        try:
+            return await fn(*args, **kwargs)
+        except ArialogError as exc:
+            raise ToolError(str(exc)) from exc
+
+    return wrapper
+
+
+class SharedTokenVerifier(TokenVerifier):
+    """Static bearer token for the HTTP transport, compared in constant time."""
+
+    def __init__(self, token: SecretStr) -> None:
+        super().__init__()
+        self._token = token.get_secret_value().encode()
+
+    async def verify_token(self, token: str) -> AccessToken | None:
+        if not hmac.compare_digest(token.encode(), self._token):
+            return None
+        return AccessToken(token=token, client_id="arialog-mcp-client", scopes=[])
+
+
+def _caller() -> AccessToken | None:
+    try:
+        return get_access_token()
+    except (RuntimeError, TypeError):  # no HTTP request (stdio / in-memory)
+        return None
 
 
 class AuditMiddleware(Middleware):
@@ -66,13 +127,19 @@ class AuditMiddleware(Middleware):
     async def on_call_tool(self, context: MiddlewareContext[Any], call_next: Any) -> Any:
         name = context.message.name
         args = json.dumps(context.message.arguments or {}, default=str)[:500]
+        who = _caller()
+        base: dict[str, Any] = {"tool": name, "tool_args": args}
+        if who is not None:
+            base["user"] = who.client_id
+            if role := (who.claims or {}).get("role"):
+                base["role"] = role
         t0 = time.monotonic()
         try:
             result = await call_next(context)
         except ToolError as exc:
             # FastMCP wraps whatever the tool raised; classify by the original cause.
             cause = exc.__cause__
-            extra = {"tool": name, "tool_args": args, "error": str(exc), "ms": _ms(t0)}
+            extra = {**base, "error": str(exc), "ms": _ms(t0)}
             if isinstance(cause, ArialogError):
                 audit.warning("tool failed", extra=extra)
             elif cause is None or isinstance(cause, ValidationError | McpValidationError):
@@ -81,16 +148,25 @@ class AuditMiddleware(Middleware):
                 audit.error("tool crashed", extra=extra, exc_info=exc)
             raise
         except (McpValidationError, ValidationError) as exc:  # bad arguments (caller mistake)
-            audit.warning(
-                "tool rejected",
-                extra={"tool": name, "tool_args": args, "error": str(exc)[:300], "ms": _ms(t0)},
-            )
+            audit.warning("tool rejected", extra={**base, "error": str(exc)[:300], "ms": _ms(t0)})
             raise
         except Exception:
-            audit.exception("tool crashed", extra={"tool": name, "tool_args": args, "ms": _ms(t0)})
+            audit.exception("tool crashed", extra={**base, "ms": _ms(t0)})
             raise
-        audit.info("tool ok", extra={"tool": name, "tool_args": args, "ms": _ms(t0)})
+        audit.info("tool ok", extra={**base, "ms": _ms(t0)})
         return result
+
+
+def _auth_provider(
+    settings: Settings, authenticator: LDAPAuthenticator | None
+) -> AuthProvider | None:
+    mode = settings.auth_mode
+    if mode == "token":
+        assert settings.http_auth_token is not None
+        return SharedTokenVerifier(settings.http_auth_token)
+    if mode == "ldap":
+        return LDAPBasicAuth(authenticator or LDAPAuthenticator.from_settings(settings))
+    return None
 
 
 def _ms(t0: float) -> int:
@@ -101,9 +177,25 @@ def _iso(ms: int) -> str:
     return datetime.fromtimestamp(ms / 1000, tz=UTC).isoformat(timespec="seconds")
 
 
-def create_server(settings: Settings, client: VRLIClient | None = None) -> FastMCP:
+def create_server(
+    settings: Settings,
+    client: VRLIClient | None = None,
+    *,
+    authenticator: LDAPAuthenticator | None = None,
+) -> FastMCP:
     owned = client is None
     vrli = client or VRLIClient(settings)
+    ldap_mode = settings.auth_mode == "ldap"
+
+    def creds() -> Credentials | None:
+        """VRLI identity for this call: the LDAP caller, or None for the service account."""
+        if not ldap_mode:
+            return None
+        who = _caller()
+        if not isinstance(who, UserAccessToken):
+            raise AuthError("this server requires an LDAP-authenticated caller")  # fail closed
+        username = settings.ldap_vrli_username_template.replace("{username}", who.client_id)
+        return Credentials(username, who.password)
 
     @asynccontextmanager
     async def lifespan(_: FastMCP) -> AsyncIterator[None]:
@@ -119,6 +211,8 @@ def create_server(settings: Settings, client: VRLIClient | None = None) -> FastM
         instructions=INSTRUCTIONS,
         middleware=[AuditMiddleware()],
         lifespan=lifespan,
+        mask_error_details=True,
+        auth=_auth_provider(settings, authenticator),
     )
 
     def prepare(
@@ -147,7 +241,14 @@ def create_server(settings: Settings, client: VRLIClient | None = None) -> FastM
     async def healthz(_: Request) -> PlainTextResponse:  # liveness only; never calls VRLI
         return PlainTextResponse("ok")
 
+    @mcp.custom_route("/readyz", methods=["GET"])
+    async def readyz(_: Request) -> PlainTextResponse:  # from breaker state; never calls VRLI
+        if vrli.breaker_open:
+            return PlainTextResponse("vrli unavailable (circuit open)", status_code=503)
+        return PlainTextResponse("ready")
+
     @mcp.tool(annotations=READ_ONLY)
+    @domain_errors
     async def version() -> VersionInfo:
         """Appliance version (also a cheap reachability probe)."""
         raw = await vrli.version()
@@ -158,6 +259,7 @@ def create_server(settings: Settings, client: VRLIClient | None = None) -> FastM
         )
 
     @mcp.tool(annotations=READ_ONLY)
+    @domain_errors
     async def log_aggregate(
         last_minutes: LastMinutes = None,
         start: Start = None,
@@ -172,7 +274,7 @@ def create_server(settings: Settings, client: VRLIClient | None = None) -> FastM
         window, path, human = prepare(last_minutes, start, end, text_contains, filters)
         min_bin = max(1, -(-window.seconds // settings.max_bins))  # ceil: never exceed max_bins
         width = max(bin_seconds or max(10, round(window.seconds / 60 / 10) * 10), min_bin)
-        raw = await vrli.aggregated(path, bin_width_ms=width * 1000)
+        raw = await vrli.aggregated(path, bin_width_ms=width * 1000, creds=creds())
         bins_raw = raw.bins[: settings.max_bins]
         values = [b.value for b in bins_raw]
         zs = zscores(values)
@@ -207,6 +309,7 @@ def create_server(settings: Settings, client: VRLIClient | None = None) -> FastM
         )
 
     @mcp.tool(annotations=READ_ONLY)
+    @domain_errors
     async def log_signatures(
         last_minutes: LastMinutes = None,
         start: Start = None,
@@ -219,7 +322,7 @@ def create_server(settings: Settings, client: VRLIClient | None = None) -> FastM
         """Group events into message templates (ids/IPs/numbers masked), most frequent first."""
         window, path, human = prepare(last_minutes, start, end, text_contains, filters)
         scan = settings.signature_scan_limit
-        raw = await vrli.events(path, limit=scan)
+        raw = await vrli.events(path, limit=scan, creds=creds())
         groups, distinct = group_signatures(
             raw.events,
             top_n=top_n,
@@ -258,6 +361,7 @@ def create_server(settings: Settings, client: VRLIClient | None = None) -> FastM
         )
 
     @mcp.tool(annotations=READ_ONLY)
+    @domain_errors
     async def log_search(
         last_minutes: LastMinutes = None,
         start: Start = None,
@@ -271,7 +375,7 @@ def create_server(settings: Settings, client: VRLIClient | None = None) -> FastM
         """Raw events, newest first. Capped by count and bytes; use for a few evidence lines."""
         window, path, human = prepare(last_minutes, start, end, text_contains, filters)
         applied = min(limit, settings.max_events)
-        raw = await vrli.events(path, limit=applied)
+        raw = await vrli.events(path, limit=applied, creds=creds())
         kept, reason = cap_events(
             raw.events,
             limit=applied,

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import inspect
 import logging
 
 import httpx
@@ -179,7 +180,7 @@ async def test_unexpected_exception_is_logged_and_surfaced(make_mcp, caplog):
         raise RuntimeError("kaboom")
 
     # reach the shared client through the first registered tool's closure
-    for cell in (await mcp.get_tool("log_search")).fn.__closure__ or ():
+    for cell in inspect.unwrap((await mcp.get_tool("log_search")).fn).__closure__ or ():
         if isinstance(cell.cell_contents, VRLIClient):
             cell.cell_contents.events = boom  # type: ignore[method-assign]
     with caplog.at_level(logging.ERROR, logger="arialog_mcp.audit"), pytest.raises(ToolError):
@@ -227,3 +228,55 @@ async def test_invalid_arguments_are_audited_as_rejected(make_mcp, caplog):
     recs = [r for r in caplog.records if r.name == "arialog_mcp.audit"]
     assert [r.getMessage() for r in recs] == ["tool rejected"]
     assert recs[0].exc_info is None  # no traceback noise for caller mistakes
+
+
+async def test_unexpected_exception_details_are_masked(make_mcp):
+    mcp = make_mcp()
+
+    async def boom(*a, **k):
+        raise RuntimeError("internal detail /etc/secret")
+
+    for cell in inspect.unwrap((await mcp.get_tool("log_search")).fn).__closure__ or ():
+        if isinstance(cell.cell_contents, VRLIClient):
+            cell.cell_contents.events = boom  # type: ignore[method-assign]
+    with pytest.raises(ToolError) as ei:
+        await call(mcp, "log_search", WINDOW)
+    assert "internal detail" not in str(ei.value)
+
+
+async def test_too_many_text_terms_rejected_by_schema(make_mcp):
+    with pytest.raises(ToolError):
+        await call(make_mcp(), "log_search", {**WINDOW, "text_contains": ["a"] * 11})
+
+
+async def test_readyz_reflects_breaker_without_touching_vrli(make_mcp, stub: Stub):
+    mcp = make_mcp()
+    app = mcp.http_app()
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://t") as c:
+        assert (await c.get("/readyz")).status_code == 200
+        await stub.faults(unavailable_next=999)
+        for _ in range(2):  # breaker_failures=2
+            with pytest.raises(ToolError):
+                await call(mcp, "log_search", WINDOW)
+        before = (await stub.stats())["request_count"]
+        r = await c.get("/readyz")
+        assert r.status_code == 503 and "circuit open" in r.text
+        assert (await stub.stats())["request_count"] == before
+
+
+async def test_http_auth_token_guards_mcp_but_not_probes(make_mcp):
+    token = "s" * 32
+    app = make_mcp(http_auth_token=token).http_app()
+    async with (
+        app.router.lifespan_context(app),
+        httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://t") as c,
+    ):
+        assert (await c.get("/healthz")).status_code == 200
+        assert (await c.get("/readyz")).status_code == 200
+        body = {"jsonrpc": "2.0", "id": 1, "method": "tools/list"}
+        hdrs = {"accept": "application/json, text/event-stream"}
+        assert (await c.post("/mcp", json=body, headers=hdrs)).status_code == 401
+        bad = {**hdrs, "authorization": "Bearer " + "x" * 32}
+        assert (await c.post("/mcp", json=body, headers=bad)).status_code == 401
+        good = {**hdrs, "authorization": f"Bearer {token}"}
+        assert (await c.post("/mcp", json=body, headers=good)).status_code != 401

@@ -151,3 +151,122 @@ async def test_concurrency_is_capped(stub: Stub, clock: FakeClock):
     await asyncio.gather(*(c.events(HOUR, limit=1) for _ in range(15)))
     assert 1 < peak <= 3
     await c.aclose()
+
+
+def test_backoff_is_jittered_capped_and_honours_retry_after(clock: FakeClock):
+    s = make_settings(backoff_base_s=1.0, backoff_max_s=5.0)
+    lo = VRLIClient(s, sleep=no_sleep, clock=clock, jitter=lambda: 0.0)
+    hi = VRLIClient(s, sleep=no_sleep, clock=clock, jitter=lambda: 1.0)
+    assert (lo._backoff(1, None), hi._backoff(1, None)) == (0.5, 1.0)
+    assert (lo._backoff(3, None), hi._backoff(3, None)) == (2.0, 4.0)
+    assert hi._backoff(10, None) == 5.0  # capped
+    assert lo._backoff(1, 3.0) == 3.0  # Retry-After wins over a shorter backoff
+    assert lo._backoff(1, 600.0) == 5.0  # but is capped too
+
+
+async def test_retry_after_header_drives_the_wait(clock: FakeClock):
+    calls = {"n": 0}
+    slept: list[float] = []
+
+    def handler(_: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return httpx.Response(503, headers={"Retry-After": "2"})
+        if calls["n"] == 2:
+            return httpx.Response(429, headers={"Retry-After": "soon"})  # unparsable -> ignored
+        return httpx.Response(200, json={"version": "8.18.0"})
+
+    async def record(d: float) -> None:
+        slept.append(d)
+
+    c = VRLIClient(
+        make_settings(backoff_base_s=0.0),
+        transport=httpx.MockTransport(handler),
+        sleep=record,
+        clock=clock,
+    )
+    assert (await c.version())["version"] == "8.18.0"
+    assert slept == [2.0, 0.0]
+    await c.aclose()
+
+
+async def test_breaker_open_property(client: VRLIClient, stub: Stub, clock: FakeClock):
+    assert client.breaker_open is False
+    await stub.faults(unavailable_next=999)
+    for _ in range(2):
+        with pytest.raises(UnavailableError):
+            await client.events(HOUR, limit=1)
+    assert client.breaker_open is True
+    clock.advance(31)
+    assert client.breaker_open is False  # cooldown over: half-open
+
+
+# ------------------------------------------------------------------ per-user sessions (LDAP)
+from pydantic import SecretStr  # noqa: E402
+
+from arialog_mcp.client import Credentials  # noqa: E402
+from vrli_stub.app import create_app  # noqa: E402
+
+
+def creds(user: str, pw: str) -> Credentials:
+    return Credentials(user, SecretStr(pw))
+
+
+@pytest.fixture
+async def users_stub():
+    s = Stub(create_app(anchor_ms=ANCHOR, users={"alice": "pa", "carol": "pc"}))
+    yield s
+    await s.http.aclose()
+
+
+async def test_each_user_gets_and_reuses_their_own_session(users_stub: Stub, clock: FakeClock):
+    c = make(users_stub, clock)
+    for _ in range(2):
+        await c.events(HOUR, limit=1, creds=creds("alice", "pa"))
+        await c.events(HOUR, limit=1, creds=creds("carol", "pc"))
+    st = await users_stub.stats()
+    assert st["logins_by_user"] == {"alice": 1, "carol": 1}
+    assert st["requests_by_user"] == {"alice": 2, "carol": 2}
+
+
+async def test_changed_password_never_reuses_the_old_session(users_stub: Stub, clock: FakeClock):
+    c = make(users_stub, clock)
+    await c.events(HOUR, limit=1, creds=creds("alice", "pa"))
+    with pytest.raises(AuthError, match="rejected the credentials"):
+        await c.events(HOUR, limit=1, creds=creds("alice", "stale"))
+
+
+async def test_user_sessions_are_bounded_lru(users_stub: Stub, clock: FakeClock):
+    c = make(users_stub, clock, max_user_sessions=1)
+    for who, pw in (("alice", "pa"), ("carol", "pc"), ("alice", "pa")):
+        await c.events(HOUR, limit=1, creds=creds(who, pw))
+    assert (await users_stub.stats())["logins_by_user"] == {"alice": 2, "carol": 1}
+
+
+async def test_user_lockout_guard_survives_session_eviction(users_stub: Stub, clock: FakeClock):
+    c = make(users_stub, clock, max_user_sessions=1)
+    with pytest.raises(AuthError):
+        await c.events(HOUR, limit=1, creds=creds("bob", "x"))
+    await c.events(HOUR, limit=1, creds=creds("alice", "pa"))  # evicts bob's session
+    with pytest.raises(AuthError, match="not retrying"):
+        await c.events(HOUR, limit=1, creds=creds("BOB", "x"))
+    assert (await users_stub.stats())["login_failures"] == 1
+
+
+async def test_without_service_account_a_credential_is_mandatory(users_stub: Stub, clock):
+    c = make(
+        users_stub,
+        clock,
+        username=None,
+        password=None,
+        transport="http",
+        http_auth_mode="ldap",
+        ldap_server_uri="ldaps://l",
+        ldap_user_dn_template="{username}",
+        ldap_user_search_base="dc=x",
+        default_role="ops",
+    )
+    with pytest.raises(AuthError, match="no VRLI credentials"):
+        await c.events(HOUR, limit=1)
+    assert (await users_stub.stats())["request_count"] == 0
+    assert (await c.version())["version"].startswith("8.18")  # unauthenticated probe still works
