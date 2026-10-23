@@ -1,5 +1,10 @@
 # arialog-mcp
 
+> This repository also contains [`nsxt-mcp/`](nsxt-mcp/README.md), a separate,
+> read-only NSX 4.x MCP server. It has its own Python package, lockfile, credentials,
+> tools, deployment files and validation. Start with its dedicated README and
+> [`examples/USAGE.md`](nsxt-mcp/examples/USAGE.md).
+
 Read-only [MCP](https://modelcontextprotocol.io) server for **VMware Aria Operations for Logs
 (vRealize Log Insight) 8.18.x**, built with FastMCP (pinned). It reduces logs *on the server*
 (counts, spike detection, message signatures, hard caps) so an LLM never receives thousands of raw lines.

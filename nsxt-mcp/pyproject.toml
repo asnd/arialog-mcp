@@ -1,0 +1,36 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "nsxt-mcp"
+version = "0.1.0"
+description = "Read-only, multi-target NSX 4.x MCP foundation"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = ["fastmcp==4.1.3", "httpx>=0.27", "pydantic>=2.6", "pydantic-settings>=2.2", "uvicorn>=0.30", "starlette>=0.40"]
+
+[dependency-groups]
+dev = ["pytest>=8", "pytest-asyncio>=0.23", "ruff>=0.4", "mypy>=1.9", "httpx2>=2.16", "pyyaml>=6", "cryptography>=42", "jsonschema>=4.18"]
+
+[project.scripts]
+nsxt-mcp = "nsxt_mcp.__main__:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/nsxt_mcp"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "W", "SIM"]
+
+[tool.mypy]
+python_version = "3.11"
+packages = ["nsxt_mcp"]
+check_untyped_defs = true

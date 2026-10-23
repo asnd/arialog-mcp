@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "nsxt": {
+      "command": "/absolute/path/to/uv",
+      "args": [
+        "--directory", "/absolute/path/to/nsxt-mcp",
+        "run", "--env-file", "/absolute/path/to/secrets/shared.env",
+        "nsxt-mcp", "--config", "/absolute/path/to/config/shared.json"
+      ]
+    }
+  }
+}

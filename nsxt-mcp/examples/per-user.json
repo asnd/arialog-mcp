@@ -1,0 +1,7 @@
+{
+  "mode": "per_user",
+  "targets": {
+    "site-a": {"url": "https://nsx-a.example.test"},
+    "site-b": {"url": "https://nsx-b.example.test"}
+  }
+}
