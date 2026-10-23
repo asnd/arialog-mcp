@@ -99,6 +99,14 @@ podman run -d -p 8000:8000 --env-file .env -e ARIALOG_HTTP_AUTH_TOKEN="$(openssl
 * A rejected login is not retried for `login_cooldown_s` (protects AD accounts from lockout).
 * Payload shapes follow the public API docs and are **not yet verified against a real 8.18 appliance**.
 
+## Documentation
+
+- [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md): current components, tools, HTTP
+  authentication modes, LDAP caller passthrough, security boundaries and testing.
+- [`.env.example`](.env.example): configuration reference with placeholder values.
+- [`scripts/e2e.sh`](scripts/e2e.sh): hermetic Podman integration test, including
+  throwaway LDAPS/OpenLDAP tests for LDAP mode.
+
 ## Develop
 Hermetic container run (ruff + mypy + pytest, `--network none`): `scripts/test-podman.sh`; full stack with the VRLI stub and an OpenLDAP container (LDAPS, LDAP-mode passthrough):
 `scripts/e2e.sh`.
