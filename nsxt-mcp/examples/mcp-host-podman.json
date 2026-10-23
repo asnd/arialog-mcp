@@ -1,0 +1,13 @@
+{
+  "mcpServers": {
+    "nsxt": {
+      "command": "/absolute/path/to/podman",
+      "args": [
+        "run", "--rm", "-i", "--http-proxy=false",
+        "--env-file", "/absolute/path/to/secrets/per-user.env",
+        "-v", "/absolute/path/to/config:/config:ro,z",
+        "localhost/nsxt-mcp:0.1.0", "--config", "/config/per-user.json"
+      ]
+    }
+  }
+}

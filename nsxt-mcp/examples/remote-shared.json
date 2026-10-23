@@ -1,0 +1,29 @@
+{
+  "mode": "shared",
+  "targets": {
+    "auth-site": {"url": "https://nsx-auth.example.test", "credential_profile": "network-reader"},
+    "site-a": {"url": "https://nsx-a.example.test", "credential_profile": "network-reader"},
+    "site-b": {"url": "https://nsx-b.example.test", "credential_profile": "network-reader"}
+  },
+  "credential_profiles": {
+    "network-reader": {
+      "username_env": "NSXT_SERVICE_USER",
+      "password_env": "NSXT_SERVICE_PASSWORD"
+    }
+  },
+  "remote": {
+    "realm": "network-operations",
+    "authentication_target": "auth-site",
+    "targets": ["site-a", "site-b"],
+    "grants": {
+      "operator@example.test": {
+        "targets": ["site-a", "site-b"],
+        "tool_groups": ["metadata", "gateway_firewall", "routing", "fabric"]
+      },
+      "site-reader@example.test": {
+        "targets": ["site-a"],
+        "tool_groups": ["metadata"]
+      }
+    }
+  }
+}

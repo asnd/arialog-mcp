@@ -1,0 +1,13 @@
+{
+  "mode": "per_user",
+  "targets": {
+    "auth-site": {"url": "https://nsx-auth.example.test"},
+    "site-a": {"url": "https://nsx-a.example.test"},
+    "site-b": {"url": "https://nsx-b.example.test"}
+  },
+  "remote": {
+    "realm": "network-operations",
+    "authentication_target": "auth-site",
+    "targets": ["site-a", "site-b"]
+  }
+}

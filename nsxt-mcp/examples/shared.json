@@ -1,0 +1,16 @@
+{
+  "mode": "shared",
+  "targets": {
+    "site-a": {
+      "url": "https://nsx-a.example.test",
+      "credential_profile": "network-reader",
+      "labels": {"site": "a"}
+    }
+  },
+  "credential_profiles": {
+    "network-reader": {
+      "username_env": "NSXT_SERVICE_USER",
+      "password_env": "NSXT_SERVICE_PASSWORD"
+    }
+  }
+}

@@ -1,0 +1,20 @@
+FROM docker.io/library/python:3.11-slim AS build
+ENV UV_LINK_MODE=copy UV_COMPILE_BYTECODE=1
+RUN pip install --no-cache-dir uv==0.10.9
+WORKDIR /app
+COPY pyproject.toml uv.lock README.md ./
+COPY src ./src
+RUN uv sync --locked --no-dev --no-editable --python 3.11 --no-managed-python
+
+FROM docker.io/library/python:3.11-slim
+RUN useradd --uid 1001 --create-home appuser
+ENV PATH="/app/.venv/bin:$PATH" PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1 \
+    XDG_CACHE_HOME=/tmp/cache
+WORKDIR /app
+COPY --from=build --chown=1001:1001 /app/.venv /app/.venv
+USER appuser
+EXPOSE 8443
+HEALTHCHECK --interval=15s --timeout=5s --start-period=10s --retries=3 \
+    CMD ["python", "-m", "nsxt_mcp.healthcheck"]
+ENTRYPOINT ["nsxt-mcp"]
+CMD ["--config", "/config/config.json"]

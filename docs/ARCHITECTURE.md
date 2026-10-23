@@ -13,7 +13,8 @@ TLS; put it behind a trusted TLS reverse proxy on remote networks.
 
 This repository contains the MCP server, stubs, tests and container files. The
 incident-analysis service described below is planning context and is not included
-in this repository.
+in this repository. A separate NSX MCP server lives in [`../nsxt-mcp/`](../nsxt-mcp/README.md);
+it is an independent package and is not part of the Aria service runtime.
 
 ## 2. Current architecture
 
