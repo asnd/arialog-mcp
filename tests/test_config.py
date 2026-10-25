@@ -60,3 +60,10 @@ def test_env_prefix(monkeypatch):
 def test_numeric_bounds(field, val):
     with pytest.raises(ValidationError):
         mk(**{field: val})
+
+
+def test_query_read_timeout_outlasts_vrli_query_timeout():
+    s = mk(query_timeout_ms=60_000, query_timeout_margin_s=20)
+    assert s.query_read_timeout_s == 80
+    with pytest.raises(ValidationError):
+        mk(query_timeout_margin_s=0)

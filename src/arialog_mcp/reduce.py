@@ -104,6 +104,32 @@ def group_signatures(
 MIN_BINS_FOR_SPIKES = 8
 
 
+@dataclass(frozen=True)
+class TimeBin:
+    start_ms: int
+    count: float
+    partial: bool  # the bin sticks out of the window, so its count covers less time
+
+
+def time_bins(
+    raw: list[tuple[int, float]], *, start_ms: int, end_ms: int, width_ms: int
+) -> list[TimeBin]:
+    """Sorted, gap-free bins covering ``[start_ms, end_ms)``.
+
+    VRLI may omit empty bins, and a missing zero would hide a burst from the z-score.
+    Bin boundaries follow VRLI's own bins (epoch-aligned when it returned none).
+    """
+    values: dict[int, float] = {}
+    for start, value in raw:
+        values[start] = values.get(start, 0.0) + value
+    phase = min(values) % width_ms if values else 0
+    first = start_ms - (start_ms - phase) % width_ms
+    grid = set(range(first, end_ms, width_ms)) | set(values)
+    return [
+        TimeBin(s, values.get(s, 0.0), s < start_ms or s + width_ms > end_ms) for s in sorted(grid)
+    ]
+
+
 def zscores(values: list[float]) -> list[float | None]:
     """Population z-score per bin; all None when there is too little data or no variance."""
     if len(values) < MIN_BINS_FOR_SPIKES:

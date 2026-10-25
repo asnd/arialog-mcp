@@ -5,10 +5,10 @@ from __future__ import annotations
 import json
 import logging
 import time
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Awaitable
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
-from typing import Annotated, Any
+from typing import Annotated, Any, TypeVar
 
 from fastmcp import FastMCP
 from fastmcp.exceptions import ToolError
@@ -21,8 +21,8 @@ from starlette.responses import PlainTextResponse
 from . import __version__
 from .client import VRLIClient
 from .config import Settings
-from .constraints import Filter, Window, build_constraints, resolve_window
-from .errors import ArialogError
+from .constraints import Constraints, Filter, Window, build_constraints, resolve_window
+from .errors import ArialogError, QueryError
 from .models import (
     AggregateResult,
     Bin,
@@ -33,7 +33,7 @@ from .models import (
     SignatureResult,
     VersionInfo,
 )
-from .reduce import cap_events, group_signatures, zscores
+from .reduce import cap_events, group_signatures, time_bins, zscores
 
 audit = logging.getLogger("arialog_mcp.audit")
 
@@ -42,6 +42,7 @@ Read-only access to VMware Aria Operations for Logs (VRLI) 8.18.x.
 Recommended order: log_aggregate (is there a spike, and when?) -> log_signatures (what are the
 dominant message types?) -> log_search (a few raw lines for evidence).
 Always give a time window: last_minutes, or start (+ optional end) as ISO-8601 WITH timezone.
+Text: text_all = every word must occur (any order); text_any = any of these phrases.
 Results are capped; check `complete`, `truncated` and `notes` before trusting counts.
 """
 
@@ -52,12 +53,21 @@ Start = Annotated[
     str | None, Field(description="Window start, ISO-8601 with timezone, e.g. 2026-10-07T12:00:00Z")
 ]
 End = Annotated[str | None, Field(description="Window end (default: now); needs start")]
-TextTerms = Annotated[
-    list[str] | None, Field(description="Message must contain ALL of these terms (max 10)")
+TextAll = Annotated[
+    list[str] | None,
+    Field(description="Every word of these terms must occur, in any order (VRLI HAS; max 10)"),
 ]
-Filters = Annotated[list[Filter] | None, Field(description="Field constraints, e.g. hostname")]
+TextAny = Annotated[
+    list[str] | None,
+    Field(description="Message contains ANY of these exact phrases (VRLI CONTAINS; max 10)"),
+]
+Filters = Annotated[
+    list[Filter] | None,
+    Field(description="Field constraints, ANDed (except same field+op, which VRLI ORs)"),
+]
 
 READ_ONLY = {"readOnlyHint": True, "destructiveHint": False, "openWorldHint": False}
+T = TypeVar("T")
 
 
 class AuditMiddleware(Middleware):
@@ -125,14 +135,22 @@ def create_server(settings: Settings, client: VRLIClient | None = None) -> FastM
         last_minutes: int | None,
         start: str | None,
         end: str | None,
-        text_contains: list[str] | None,
+        text_all: list[str] | None,
+        text_any: list[str] | None,
         filters: list[Filter] | None,
-    ) -> tuple[Window, str, list[str]]:
+    ) -> tuple[Window, Constraints]:
         window = resolve_window(
             last_minutes, start, end, now=datetime.now(UTC), max_hours=settings.max_window_hours
         )
-        path, human = build_constraints(window, text_contains, filters)
-        return window, path, human
+        return window, build_constraints(window, text_all, text_any, filters)
+
+    async def run(cons: Constraints, query: Awaitable[T]) -> T:
+        try:
+            return await query
+        except QueryError as exc:
+            if cons.error_hint is None:
+                raise
+            raise QueryError(f"{exc}; {cons.error_hint}") from exc
 
     def info(endpoint: str, window: Window, human: list[str]) -> QueryInfo:
         return QueryInfo(
@@ -162,47 +180,63 @@ def create_server(settings: Settings, client: VRLIClient | None = None) -> FastM
         last_minutes: LastMinutes = None,
         start: Start = None,
         end: End = None,
-        text_contains: TextTerms = None,
+        text_all: TextAll = None,
+        text_any: TextAny = None,
         filters: Filters = None,
         bin_seconds: Annotated[
             int | None, Field(ge=1, description="Bin width; default picks ~60 bins")
         ] = None,
     ) -> AggregateResult:
         """Event counts over time bins with spike detection (z-score). Use this FIRST."""
-        window, path, human = prepare(last_minutes, start, end, text_contains, filters)
-        min_bin = max(1, -(-window.seconds // settings.max_bins))  # ceil: never exceed max_bins
+        window, cons = prepare(last_minutes, start, end, text_all, text_any, filters)
+        start_ms = int(window.start.timestamp() * 1000)
+        end_ms = int(window.end.timestamp() * 1000)
+        # A window not aligned to the bin grid touches one extra bin, hence max_bins - 1.
+        min_bin = max(1, -(-(end_ms - start_ms) // ((settings.max_bins - 1) * 1000)))  # ceil
         width = max(bin_seconds or max(10, round(window.seconds / 60 / 10) * 10), min_bin)
-        raw = await vrli.aggregated(path, bin_width_ms=width * 1000)
-        bins_raw = raw.bins[: settings.max_bins]
-        values = [b.value for b in bins_raw]
-        zs = zscores(values)
+        raw = await run(
+            cons,
+            vrli.aggregated(cons.path, bin_width_ms=width * 1000, limit=settings.max_bins + 2),
+        )
+        grid = time_bins(
+            [(b.start_ms, b.value) for b in raw.bins],
+            start_ms=start_ms,
+            end_ms=end_ms,
+            width_ms=width * 1000,
+        )
+        notes = list(cons.notes)
+        if len(grid) > settings.max_bins:
+            notes.append(f"{len(grid) - settings.max_bins} oldest bins dropped (cap)")
+            grid = grid[-settings.max_bins :]
+        full = [i for i, b in enumerate(grid) if not b.partial]
+        z_of = dict(zip(full, zscores([grid[i].count for i in full]), strict=True))
         bins = [
             Bin(
                 start=_iso(b.start_ms),
-                count=int(b.value),
-                zscore=z,
-                spike=z is not None and z >= settings.spike_zscore,
+                count=int(b.count),
+                zscore=z_of.get(i),
+                spike=(z := z_of.get(i)) is not None and z >= settings.spike_zscore,
+                partial=b.partial,
             )
-            for b, z in zip(bins_raw, zs, strict=True)
+            for i, b in enumerate(grid)
         ]
-        notes: list[str] = []
         if bin_seconds and bin_seconds < min_bin:
             notes.append(f"bin_seconds raised to {width} to keep at most {settings.max_bins} bins")
-        if len(raw.bins) > settings.max_bins:
-            notes.append(f"{len(raw.bins) - settings.max_bins} bins dropped (cap)")
+        if raw.limit_reached:
+            notes.append("VRLI bin limit reached; later bins may be missing")
         if not raw.complete:
             notes.append("VRLI returned a partial result (query timeout); counts may be low")
-        if all(z is None for z in zs):
+        if all(b.zscore is None for b in bins):
             notes.append("spike detection skipped: too few bins or no variance")
         spikes = [b for b in bins if b.spike]
         return AggregateResult(
-            query=info("/api/v2/aggregated-events", window, human),
+            query=info("/api/v2/aggregated-events", window, cons.human),
             bin_seconds=width,
             total=sum(b.count for b in bins),
             peak=max(bins, key=lambda b: b.count, default=None),
             spikes=spikes,
             bins=bins,
-            complete=raw.complete,
+            complete=raw.complete and not raw.limit_reached,
             notes=notes,
         )
 
@@ -211,15 +245,16 @@ def create_server(settings: Settings, client: VRLIClient | None = None) -> FastM
         last_minutes: LastMinutes = None,
         start: Start = None,
         end: End = None,
-        text_contains: TextTerms = None,
+        text_all: TextAll = None,
+        text_any: TextAny = None,
         filters: Filters = None,
         top_n: Annotated[int, Field(ge=1, le=50)] = 15,
         samples_per_signature: Annotated[int, Field(ge=0, le=3)] = 2,
     ) -> SignatureResult:
         """Group events into message templates (ids/IPs/numbers masked), most frequent first."""
-        window, path, human = prepare(last_minutes, start, end, text_contains, filters)
+        window, cons = prepare(last_minutes, start, end, text_all, text_any, filters)
         scan = settings.signature_scan_limit
-        raw = await vrli.events(path, limit=scan)
+        raw = await run(cons, vrli.events(cons.path, limit=scan))
         groups, distinct = group_signatures(
             raw.events,
             top_n=top_n,
@@ -227,7 +262,7 @@ def create_server(settings: Settings, client: VRLIClient | None = None) -> FastM
             max_text_chars=settings.max_text_chars,
         )
         truncated = len(raw.events) >= scan
-        notes: list[str] = []
+        notes = list(cons.notes)
         if truncated:
             notes.append(
                 f"scan stopped at {scan} events (newest first): counts are lower bounds and the "
@@ -236,7 +271,7 @@ def create_server(settings: Settings, client: VRLIClient | None = None) -> FastM
         if not raw.complete:
             notes.append("VRLI returned a partial result (query timeout)")
         return SignatureResult(
-            query=info("/api/v2/events", window, human),
+            query=info("/api/v2/events", window, cons.human),
             scanned=len(raw.events),
             distinct_signatures=distinct,
             scan_truncated=truncated,
@@ -262,23 +297,24 @@ def create_server(settings: Settings, client: VRLIClient | None = None) -> FastM
         last_minutes: LastMinutes = None,
         start: Start = None,
         end: End = None,
-        text_contains: TextTerms = None,
+        text_all: TextAll = None,
+        text_any: TextAny = None,
         filters: Filters = None,
         limit: Annotated[
             int, Field(ge=1, le=1000, description="Max events (server cap applies)")
         ] = 50,
     ) -> SearchResult:
         """Raw events, newest first. Capped by count and bytes; use for a few evidence lines."""
-        window, path, human = prepare(last_minutes, start, end, text_contains, filters)
+        window, cons = prepare(last_minutes, start, end, text_all, text_any, filters)
         applied = min(limit, settings.max_events)
-        raw = await vrli.events(path, limit=applied)
+        raw = await run(cons, vrli.events(cons.path, limit=applied))
         kept, reason = cap_events(
             raw.events,
             limit=applied,
             max_bytes=settings.max_bytes,
             max_text_chars=settings.max_text_chars,
         )
-        notes: list[str] = []
+        notes = list(cons.notes)
         if limit > applied:
             notes.append(f"limit lowered to the server cap of {applied}")
         if len(raw.events) >= applied and reason is None:
@@ -286,7 +322,7 @@ def create_server(settings: Settings, client: VRLIClient | None = None) -> FastM
         if not raw.complete:
             notes.append("VRLI returned a partial result (query timeout)")
         return SearchResult(
-            query=info("/api/v2/events", window, human),
+            query=info("/api/v2/events", window, cons.human),
             returned=len(kept),
             complete=raw.complete,
             truncated=reason is not None,

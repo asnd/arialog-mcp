@@ -68,13 +68,30 @@ async def main() -> None:
     ok("aggregate finds the SCSI burst")
 
     sig = await call(MCP, "log_signatures", window)
-    assert sig["signatures"][0]["template"].startswith("ScsiDeviceIO")
+    assert "ScsiDeviceIO" in sig["signatures"][0]["template"]
     assert sig["signatures"][0]["count"] == 1200 and not sig["scan_truncated"]
     ok("signatures group + rank")
 
-    srch = await call(MCP, "log_search", {**window, "text_contains": ["Lost access"], "limit": 5})
+    srch = await call(MCP, "log_search", {**window, "text_any": ["Lost access"], "limit": 5})
     assert srch["returned"] == 4 and srch["events"][0]["host"] == "esx-02"
-    ok("search with filter")
+    assert srch["events"][0]["fields"]["appname"] == "vmkernel"
+    ok("search with filter; hostname/appname read from text offsets")
+
+    both = await call(MCP, "log_search", {**window, "text_all": ["volume", "lost"], "limit": 10})
+    none = await call(MCP, "log_search", {**window, "text_all": ["volume", "ScsiDeviceIO"]})
+    assert both["returned"] == 4 and none["returned"] == 0
+    ok("text_all keeps AND semantics")
+
+    sparse = await call(
+        MCP, "log_aggregate", {**window, "text_any": ["ScsiDeviceIO"], "bin_seconds": 300}
+    )
+    # The stub anchors at container start, so the 5-minute burst may straddle two 300 s bins;
+    # then only the bigger part is a spike. Empty bins (omitted by the stub) must be zero-filled.
+    nonzero = [b for b in sparse["bins"] if b["count"]]
+    assert sparse["total"] == 1200 and 1 <= len(nonzero) <= 2, nonzero
+    assert sparse["spikes"] and sparse["spikes"][0]["start"] == sparse["peak"]["start"], sparse
+    assert len(sparse["bins"]) - len(nonzero) >= 20  # gaps were zero-filled
+    ok("aggregate zero-fills sparse bins")
 
     # --- failure paths ---
     await expect_error(MCP, "log_search", {"start": "2026-10-07T10:00:00"}, "timezone")
@@ -83,6 +100,10 @@ async def main() -> None:
     stub("POST", "/_stub/faults", {"expire_sessions": True})
     assert (await call(MCP, "log_search", {**window, "limit": 1}))["returned"] == 1
     ok("expired session -> transparent re-login")
+
+    stub("POST", "/_stub/faults", {"timeout_sessions": True})
+    assert (await call(MCP, "log_search", {**window, "limit": 1}))["returned"] == 1
+    ok("440 session timeout -> transparent re-login")
 
     stub("POST", "/_stub/faults", {"unavailable_next": 3})
     assert (await call(MCP, "log_search", {**window, "limit": 1}))["returned"] == 1

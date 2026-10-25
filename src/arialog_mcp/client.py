@@ -28,8 +28,10 @@ from .reduce import RawEvent
 log = logging.getLogger("arialog_mcp.client")
 
 RETRY_STATUS = {429, 502, 503, 504}
+SESSION_EXPIRED = {401, 440}  # 440 "Login Timeout": the session ID has expired
 SESSION_REFRESH_FRACTION = 0.9
 DEFAULT_SESSION_TTL_S = 1800
+MAX_RETRY_AFTER_S = 30.0
 
 
 @dataclass
@@ -47,12 +49,13 @@ class RawBin:
 
 @dataclass
 class RawBins:
-    bins: list[RawBin]
+    bins: list[RawBin]  # sorted by start_ms
     complete: bool
+    limit_reached: bool  # VRLI returned as many bins as requested; more may exist
 
 
 class CircuitBreaker:
-    """Opens after N consecutive infrastructure failures; half-opens after a cooldown."""
+    """Opens after N consecutive infrastructure failures; after a cooldown one probe passes."""
 
     def __init__(self, threshold: int, cooldown_s: float, clock: Callable[[], float]) -> None:
         self._threshold = threshold
@@ -60,21 +63,29 @@ class CircuitBreaker:
         self._clock = clock
         self._failures = 0
         self._opened_at: float | None = None
+        self._probing = False
 
-    def before(self) -> None:
+    def before(self) -> bool:
+        """Raise while open; return True when this call is the single half-open probe."""
         if self._opened_at is None:
-            return
+            return False
         remaining = self._cooldown - (self._clock() - self._opened_at)
-        if remaining > 0:
+        if remaining > 0 or self._probing:
+            wait = max(remaining, 1.0)
             raise BreakerOpenError(
-                f"VRLI marked unavailable after repeated failures; retry in {remaining:.0f}s"
+                f"VRLI marked unavailable after repeated failures; retry in {wait:.0f}s"
             )
-        self._opened_at = None  # half-open: let one request through
-        self._failures = self._threshold - 1
+        self._probing = True
+        self._failures = self._threshold - 1  # one more failure re-opens
+        return True
+
+    def end_probe(self) -> None:
+        self._probing = False
 
     def success(self) -> None:
         self._failures = 0
         self._opened_at = None
+        self._probing = False
 
     def failure(self) -> None:
         self._failures += 1
@@ -101,6 +112,9 @@ class VRLIClient:
             verify=verify,
             trust_env=settings.trust_env,
             transport=transport,
+        )
+        self._query_timeout = httpx.Timeout(
+            settings.request_timeout_s, read=settings.query_read_timeout_s
         )
         self._sem = asyncio.Semaphore(settings.max_concurrency)
         self._breaker = CircuitBreaker(
@@ -165,26 +179,42 @@ class VRLIClient:
 
     # ------------------------------------------------------------------ requests
     async def _get(
-        self, path: str, params: dict[str, Any] | None = None, *, auth: bool = True
+        self, path: str, params: dict[str, Any] | None = None, *, query: bool = False
     ) -> Any:
-        self._breaker.before()
+        probe = self._breaker.before()
+        try:
+            return await self._get_with_retries(path, params, query=query)
+        finally:
+            if probe:
+                self._breaker.end_probe()
+
+    async def _get_with_retries(
+        self, path: str, params: dict[str, Any] | None, *, query: bool
+    ) -> Any:
+        timeout = self._query_timeout if query else httpx.USE_CLIENT_DEFAULT
         attempt = 0
         relogged = False
         last: ArialogError = UnavailableError("VRLI request failed")
         while True:
+            retry_after = 0.0
             try:
-                token = await self._bearer() if auth else None
-                headers = {"Authorization": f"Bearer {token}"} if token else {}
+                token = await self._bearer()
                 async with self._sem:
-                    resp = await self._http.get(path, params=params, headers=headers)
+                    resp = await self._http.get(
+                        path,
+                        params=params,
+                        headers={"Authorization": f"Bearer {token}"},
+                        timeout=timeout,
+                    )
                 code = resp.status_code
-                if code == 401 and token and not relogged:
+                if code in SESSION_EXPIRED and not relogged:
                     self._invalidate(token)
                     relogged = True
                     continue
-                if code in (401, 403):
+                if code in SESSION_EXPIRED or code == 403:
                     raise AuthError(f"VRLI refused the session (HTTP {code})")
                 if code in RETRY_STATUS or code >= 500:
+                    retry_after = _retry_after(resp)
                     raise UnavailableError(f"VRLI unavailable (HTTP {code})")
                 if code >= 400:
                     self._breaker.success()  # the appliance is healthy; the query was bad
@@ -197,13 +227,20 @@ class VRLIClient:
                 return payload
             except UnavailableError as exc:  # includes a 503 during login (appliance starting)
                 last = exc
+            except httpx.ReadTimeout as exc:
+                # VRLI answers partial results at its own query timeout; silence beyond that
+                # means it is overloaded. Re-sending the same heavy query would make it worse.
+                self._breaker.failure()
+                raise UnavailableError(
+                    "VRLI did not answer in time (ReadTimeout); narrow the window or add filters"
+                ) from exc
             except httpx.HTTPError as exc:
                 last = UnavailableError(f"VRLI unavailable: request failed ({type(exc).__name__})")
             attempt += 1
             if attempt > self._s.retries:
                 self._breaker.failure()
                 raise last
-            delay = self._s.backoff_base_s * (2 ** (attempt - 1))
+            delay = max(self._s.backoff_base_s * (2 ** (attempt - 1)), retry_after)
             log.warning(
                 "vrli request retry",
                 extra={"event": "retry", "attempt": attempt, "delay_s": delay, "reason": str(last)},
@@ -212,7 +249,7 @@ class VRLIClient:
 
     # ------------------------------------------------------------------ API
     async def version(self) -> dict[str, Any]:
-        data = await self._get("/api/v1/version", auth=False)
+        data = await self._get("/api/v2/version")  # requires a session (API docs)
         return data if isinstance(data, dict) else {"raw": data}
 
     async def events(self, constraints: str, *, limit: int) -> RawEvents:
@@ -223,6 +260,7 @@ class VRLIClient:
                 "timeout": self._s.query_timeout_ms,
                 "order-by-direction": "DESC",
             },
+            query=True,
         )
         try:
             events = [_parse_event(e) for e in data.get("events", [])]
@@ -230,21 +268,32 @@ class VRLIClient:
         except (AttributeError, KeyError, TypeError, ValueError) as exc:
             raise UnavailableError("VRLI events response had an unexpected shape") from exc
 
-    async def aggregated(self, constraints: str, *, bin_width_ms: int) -> RawBins:
+    async def aggregated(self, constraints: str, *, bin_width_ms: int, limit: int) -> RawBins:
+        # VRLI returns 100 bins unless `limit` is given (max 2000); bin order and whether
+        # empty bins are included are not documented, so the result is sorted here and
+        # gaps are filled by the caller.
         data = await self._get(
             f"/api/v2/aggregated-events/{constraints}",
             {
                 "bin-width": bin_width_ms,
                 "aggregation-function": "COUNT",
+                "limit": limit,
                 "timeout": self._s.query_timeout_ms,
             },
+            query=True,
         )
         try:
+            raw = data.get("bins", [])
             bins = [
                 RawBin(int(b["minTimestamp"]), int(b["maxTimestamp"]), float(b.get("value", 0)))
-                for b in data.get("bins", [])
+                for b in raw
             ]
-            return RawBins(bins=bins, complete=bool(data.get("complete", True)))
+            bins.sort(key=lambda b: b.start_ms)
+            return RawBins(
+                bins=bins,
+                complete=bool(data.get("complete", True)),
+                limit_reached=len(raw) >= limit,
+            )
         except (AttributeError, KeyError, TypeError, ValueError) as exc:
             raise UnavailableError(
                 "VRLI aggregated-events response had an unexpected shape"
@@ -252,12 +301,37 @@ class VRLIClient:
 
 
 def _parse_event(raw: dict[str, Any]) -> RawEvent:
+    text = str(raw.get("text", ""))
     fields: dict[str, str] = {}
     for f in raw.get("fields", []) or []:
+        if not isinstance(f, dict):
+            continue
         name = f.get("name")
-        if name and name not in fields:
-            fields[str(name)] = str(f.get("content", ""))
-    return RawEvent(ts_ms=int(raw["timestamp"]), text=str(raw.get("text", "")), fields=fields)
+        if not name or str(name) in fields:
+            continue
+        value = _field_value(f, text)
+        if value is not None:
+            fields[str(name)] = value
+    return RawEvent(ts_ms=int(raw["timestamp"]), text=text, fields=fields)
+
+
+def _field_value(f: dict[str, Any], text: str) -> str | None:
+    """A field carries either ``content`` or a ``startPosition``/``length`` slice of the text."""
+    if "content" in f:
+        return str(f["content"])
+    start, length = f.get("startPosition"), f.get("length")
+    if type(start) is not int or type(length) is not int or start < 0 or length < 0:
+        return None
+    # Offsets index the event text as a Java string, i.e. in UTF-16 code units.
+    units = text.encode("utf-16-le")[2 * start : 2 * (start + length)]
+    if len(units) != 2 * length:
+        return None
+    return units.decode("utf-16-le", errors="replace")
+
+
+def _retry_after(resp: httpx.Response) -> float:
+    value = resp.headers.get("retry-after", "")
+    return min(float(value), MAX_RETRY_AFTER_S) if value.isdigit() else 0.0
 
 
 def _detail(resp: httpx.Response) -> str:
