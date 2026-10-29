@@ -104,6 +104,13 @@ async def test_shared_user_must_have_explicit_grant(settings):
         assert targets.json()["result"]["structuredContent"]["result"] == ["a"]
 
 
+async def test_global_pre_auth_budget_limits_username_spraying(settings):
+    async with remote_client(settings, burst=1) as (client, _, stub, _):
+        assert (await rpc(client, "bad")).status_code == 401
+        assert (await rpc(client, "alice@test")).status_code == 429
+        assert len(stub.requests) == 1
+
+
 async def test_tool_group_grant_checked_before_read(settings):
     grants = {"alice@test": {"targets": ["a"], "tool_groups": ["metadata"]}}
     async with remote_client(settings, "shared", grants=grants) as (client, _, stub, _):

@@ -1,6 +1,7 @@
 """Explicit execution identities; remote callers must be authenticated by an adapter."""
 
 import os
+import stat
 from contextvars import ContextVar
 from dataclasses import dataclass, field
 
@@ -8,6 +9,8 @@ from pydantic import SecretStr
 
 from .config import ALL_TOOL_GROUPS, Settings
 from .errors import AccessDenied, AuthenticationFailed
+
+MAX_PASSWORD_FILE_BYTES = 4096
 
 
 @dataclass(frozen=True)
@@ -61,7 +64,16 @@ class CredentialProvider:
                 password = os.environ[profile.password_env]
             else:
                 assert profile.password_file is not None
-                password = profile.password_file.read_text().rstrip("\r\n")
+                metadata = profile.password_file.stat()
+                if not stat.S_ISREG(metadata.st_mode) or stat.S_IMODE(metadata.st_mode) & 0o077:
+                    raise AuthenticationFailed("Password file must be a private regular file")
+                with profile.password_file.open("rb") as secret_file:
+                    raw = secret_file.read(MAX_PASSWORD_FILE_BYTES + 1)
+                if len(raw) > MAX_PASSWORD_FILE_BYTES:
+                    raise AuthenticationFailed("Password file exceeds the configured size limit")
+                password = raw.decode("utf-8").rstrip("\r\n")
+        except AuthenticationFailed:
+            raise
         except (KeyError, OSError, UnicodeError):
             raise AuthenticationFailed("Credential secret unavailable") from None
         if not username or not password or ":" in username:

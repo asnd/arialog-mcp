@@ -163,7 +163,12 @@ def operation_response(request):
     objects = {
         gateway: {"id": "t0", "ha_mode": "ACTIVE_STANDBY"},
         root + "/tier-1s/t1": {"id": "t1", "tier0_path": "/infra/tier-0s/t0"},
-        locale + "/bgp": {"enabled": True, "local_as_num": "65001", "password": "secret-bgp"},
+        locale + "/bgp": {
+            "enabled": True,
+            "local_as_num": "65001",
+            "password": "secret-bgp",
+            "access_token": "secret-token",
+        },
         root + "/segments/seg": {"id": "seg", "connectivity_path": "/infra/tier-1s/t1"},
         "/api/v1/cluster/status": {
             "mgmt_cluster_status": {"status": "STABLE"},

@@ -34,9 +34,12 @@ The HTTP auth modes are `none`, `token`, and `ldap`:
 
 | Mode | MCP caller authentication | VRLI execution identity | Constraints |
 |---|---|---|---|
-| `none` | None | Configured service account | Loopback only by default; remote unauthenticated mode must be explicitly enabled for a trusted authenticating proxy |
-| `token` | Shared bearer token | Configured service account | Token is at least 16 characters; compare in constant time |
-| `ldap` | HTTP Basic checked through LDAPS as the caller | The same caller, per-user passthrough | No service-account fallback; LDAPS/TLS verification required by default |
+| `none` | None | Configured service account | Loopback only; remote mode requires TLS-proxy acknowledgement and explicit unauthenticated access |
+| `token` | Shared bearer token | Configured service account | Token is at least 16 characters; compare in constant time; remote TLS proxy required |
+| `ldap` | HTTP Basic checked through LDAPS as the caller | The same caller, per-user passthrough | No service-account fallback; verified LDAPS and remote TLS proxy required |
+
+Any non-loopback HTTP bind requires `ARIALOG_HTTP_BEHIND_TLS_PROXY=true`; this
+acknowledges the deployment boundary but does not itself configure TLS.
 
 Setting `ARIALOG_HTTP_AUTH_TOKEN` while `ARIALOG_HTTP_AUTH_MODE=none` retains the
 pre-LDAP behavior and enables token mode. Health endpoints remain unauthenticated;
@@ -56,6 +59,8 @@ Tools are read-only by construction. VRLI session login is the only non-GET
 operation. Event and byte caps, timeout checks, validation, circuit breaking,
 retry/backoff and per-user login protection bound the work. Results include query
 constraints and notes so incomplete results are not mistaken for exhaustive data.
+Upstream response bodies, event fields, and per-caller request rates are bounded;
+search/signature outputs redact common credential material before returning it.
 
 ## 4. Authentication and identity
 
@@ -66,6 +71,11 @@ With `none` or `token`, the server uses the configured VRLI account (`username`,
 protects the MCP endpoint; it does not alter the VRLI execution identity.
 
 ### LDAP caller passthrough
+
+LDAP usernames are restricted to a DN-safe character set, group lookup is tied to
+the authenticated DN/UPN rather than a broad attribute search, and bind attempts
+have per-user lockout and process-wide rate limits. Directory outages return
+service-unavailable responses rather than being presented as bad credentials.
 
 With `ARIALOG_HTTP_AUTH_MODE=ldap`:
 
@@ -126,7 +136,8 @@ as part of a larger operations workspace.
   OpenLDAP over LDAPS with a generated CA to check LDAP authentication and per-user
   VRLI passthrough.
 - CI runs Ruff, formatting checks, mypy, pytest on Python 3.11–3.13, and builds the
-  container image.
+  container image. The independent NSX package has its own Python 3.11–3.13 CI
+  job and a 90% measured line-coverage floor.
 
 Run locally:
 

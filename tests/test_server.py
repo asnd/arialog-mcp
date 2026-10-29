@@ -8,9 +8,11 @@ import pytest
 from fastmcp import Client
 from fastmcp.exceptions import ToolError
 
-from arialog_mcp.client import VRLIClient
+from arialog_mcp.client import RawEvents, VRLIClient
+from arialog_mcp.reduce import RawEvent
 from arialog_mcp.server import create_server
-from conftest import END, START, FakeClock, Stub, make_settings, no_sleep
+from arialog_mcp.service import ArialogService
+from conftest import ANCHOR, END, START, FakeClock, Stub, make_settings, no_sleep
 
 WINDOW = {"start": START, "end": END}
 
@@ -164,13 +166,19 @@ async def test_signatures_empty_window(make_mcp):
 
 async def test_audit_log_records_calls_without_secrets(make_mcp, caplog):
     caplog.set_level(logging.INFO, logger="arialog_mcp.audit")
-    await call(make_mcp(), "log_search", {**WINDOW, "limit": 1})
+    await call(
+        make_mcp(),
+        "log_search",
+        {**WINDOW, "limit": 1, "text_contains": ["audit-secret-value"]},
+    )
     with pytest.raises(ToolError):
         await call(make_mcp(), "log_search", {"start": "2026-10-07T10:00:00"})
     recs = [r for r in caplog.records if r.name == "arialog_mcp.audit"]
     assert [r.getMessage() for r in recs] == ["tool ok", "tool failed"]
     assert recs[0].tool == "log_search" and recs[0].ms >= 0
+    assert not hasattr(recs[0], "tool_args")
     assert "placeholder" not in caplog.text and "Bearer" not in caplog.text
+    assert "audit-secret-value" not in caplog.text
 
 
 async def test_unexpected_exception_is_logged_and_surfaced(make_mcp, caplog):
@@ -179,10 +187,9 @@ async def test_unexpected_exception_is_logged_and_surfaced(make_mcp, caplog):
     async def boom(*a, **k):
         raise RuntimeError("kaboom")
 
-    # reach the shared client through the first registered tool's closure
     for cell in inspect.unwrap((await mcp.get_tool("log_search")).fn).__closure__ or ():
-        if isinstance(cell.cell_contents, VRLIClient):
-            cell.cell_contents.events = boom  # type: ignore[method-assign]
+        if isinstance(cell.cell_contents, ArialogService):
+            cell.cell_contents.client.events = boom  # type: ignore[method-assign]
     with caplog.at_level(logging.ERROR, logger="arialog_mcp.audit"), pytest.raises(ToolError):
         await call(mcp, "log_search", WINDOW)
     assert any(r.getMessage() == "tool crashed" for r in caplog.records)
@@ -237,11 +244,38 @@ async def test_unexpected_exception_details_are_masked(make_mcp):
         raise RuntimeError("internal detail /etc/secret")
 
     for cell in inspect.unwrap((await mcp.get_tool("log_search")).fn).__closure__ or ():
-        if isinstance(cell.cell_contents, VRLIClient):
-            cell.cell_contents.events = boom  # type: ignore[method-assign]
+        if isinstance(cell.cell_contents, ArialogService):
+            cell.cell_contents.client.events = boom  # type: ignore[method-assign]
     with pytest.raises(ToolError) as ei:
         await call(mcp, "log_search", WINDOW)
     assert "internal detail" not in str(ei.value)
+
+
+async def test_search_and_signature_outputs_redact_sensitive_log_content(make_mcp):
+    mcp = make_mcp()
+
+    async def events(*args, **kwargs):
+        return RawEvents(
+            [
+                RawEvent(
+                    ANCHOR,
+                    'password="log-secret" Authorization: Bearer token-value',
+                    {"hostname": "node-a", "api_key": "field-secret"},
+                )
+            ],
+            complete=True,
+        )
+
+    for cell in inspect.unwrap((await mcp.get_tool("log_search")).fn).__closure__ or ():
+        if isinstance(cell.cell_contents, ArialogService):
+            cell.cell_contents.client.events = events  # type: ignore[method-assign]
+    search = await call(mcp, "log_search", WINDOW)
+    signatures = await call(mcp, "log_signatures", WINDOW)
+    rendered = str(search) + str(signatures)
+    assert "log-secret" not in rendered
+    assert "token-value" not in rendered
+    assert "field-secret" not in rendered
+    assert "[redacted]" in rendered
 
 
 async def test_too_many_text_terms_rejected_by_schema(make_mcp):
@@ -280,3 +314,30 @@ async def test_http_auth_token_guards_mcp_but_not_probes(make_mcp):
         assert (await c.post("/mcp", json=body, headers=bad)).status_code == 401
         good = {**hdrs, "authorization": f"Bearer {token}"}
         assert (await c.post("/mcp", json=body, headers=good)).status_code != 401
+
+
+async def test_http_tool_calls_are_rate_limited_per_authenticated_caller(make_mcp):
+    token = "r" * 32
+    app = make_mcp(http_auth_token=token, caller_burst=1).http_app(
+        stateless_http=True, json_response=True
+    )
+    body = {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "tools/call",
+        "params": {"name": "version", "arguments": {}},
+    }
+    headers = {
+        "authorization": f"Bearer {token}",
+        "accept": "application/json, text/event-stream",
+    }
+    async with (
+        app.router.lifespan_context(app),
+        httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://t") as client,
+    ):
+        first = await client.post("/mcp", json=body, headers=headers)
+        second = await client.post("/mcp", json=body, headers=headers)
+    assert first.status_code == second.status_code == 200
+    assert not first.json()["result"].get("isError")
+    assert second.json()["result"]["isError"]
+    assert "request budget" in second.json()["result"]["content"][0]["text"]

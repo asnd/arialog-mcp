@@ -45,7 +45,9 @@ async def test_routing_scope_nested_routes_bgp_and_secrets(ops, caller):
             "nsx_get_bgp_config", {"target": "a", "tier0_id": "t0", "locale_service_id": "ls"}
         )
         assert config.structured_content["data"]["password"] == "[redacted]"
+        assert config.structured_content["data"]["access_token"] == "[redacted]"
         assert "secret-bgp" not in str(config.content)
+        assert "secret-token" not in str(config.content)
     assert all(r.method == "GET" for r in stub.requests)
 
 

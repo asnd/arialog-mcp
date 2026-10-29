@@ -142,6 +142,24 @@ async def test_retry_after(settings, caller):
     await registry.aclose()
 
 
+async def test_retry_after_is_capped(settings, caller):
+    settings.attempts = 2
+    delays = []
+
+    async def sleep(delay):
+        delays.append(delay)
+
+    def stub(request):
+        if not delays:
+            return httpx.Response(503, headers={"Retry-After": "3600"})
+        return httpx.Response(200, json={"ok": True})
+
+    registry = TargetRegistry(settings, transport=httpx.MockTransport(stub), sleep=sleep)
+    assert await registry.get("a", "node_version", caller) == {"ok": True}
+    assert delays == [8]
+    await registry.aclose()
+
+
 async def test_breaker_and_recovery(settings, caller):
     settings.attempts = 1
     settings.breaker_threshold = 1
@@ -162,6 +180,41 @@ async def test_breaker_and_recovery(settings, caller):
     status[0] = 200
     await registry.get("a", "node_version", caller)
     assert registry.breakers["a"].opened_at is None
+    await registry.aclose()
+
+
+async def test_recovery_probe_is_single_flight(settings, caller):
+    settings.attempts = 1
+    settings.breaker_threshold = 1
+    now = [0.0]
+    hold_probe = asyncio.Event()
+    probe_entered = asyncio.Event()
+    calls = 0
+
+    async def stub(request):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return httpx.Response(503)
+        probe_entered.set()
+        await hold_probe.wait()
+        return httpx.Response(200, json={"ok": True})
+
+    registry = TargetRegistry(
+        settings,
+        transport=httpx.MockTransport(stub),
+        clock=lambda: now[0],
+    )
+    with pytest.raises(Unavailable):
+        await registry.get("a", "node_version", caller)
+    now[0] = 31
+    probe = asyncio.create_task(registry.get("a", "node_version", caller))
+    await probe_entered.wait()
+    with pytest.raises(Unavailable, match="recovery probe"):
+        await registry.get("a", "node_version", caller)
+    hold_probe.set()
+    assert await probe == {"ok": True}
+    assert calls == 2
     await registry.aclose()
 
 

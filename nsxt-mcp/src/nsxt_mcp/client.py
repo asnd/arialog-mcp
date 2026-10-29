@@ -40,6 +40,22 @@ class PageResult(BaseModel):
     pages: int
 
 
+class NoCookieTransport(httpx.AsyncBaseTransport):
+    """Prevent pooled clients from sharing upstream cookies across callers."""
+
+    def __init__(self, transport: httpx.AsyncBaseTransport):
+        self.transport = transport
+
+    async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+        request.headers.pop("cookie", None)
+        response = await self.transport.handle_async_request(request)
+        response.headers.pop("set-cookie", None)
+        return response
+
+    async def aclose(self) -> None:
+        await self.transport.aclose()
+
+
 def decode_json(body: bytes | bytearray) -> Any:
     """JSON observations must not turn NaN/Infinity/overflow into silent null outputs."""
 
@@ -89,6 +105,7 @@ class TargetRegistry:
         self.breakers: dict[str, Breaker] = {}
         self.shared_clients: dict[str, httpx.AsyncClient] = {}
         self.versions: dict[str, str] = {}
+        self.breaker_probes: set[str] = set()
 
     def list_targets(self, caller: Caller) -> list[str]:
         return sorted(set(self.settings.targets) & caller.allowed_targets)
@@ -102,13 +119,13 @@ class TargetRegistry:
     def _new_client(self, target: str) -> httpx.AsyncClient:
         config = self.settings.targets[target]
         tls = ssl.create_default_context(cafile=str(config.ca_bundle) if config.ca_bundle else None)
+        transport = self.transport or httpx.AsyncHTTPTransport(verify=tls)
         return httpx.AsyncClient(
             base_url=config.url,
-            verify=tls,
             follow_redirects=False,
             trust_env=False,
             timeout=self.settings.timeout,
-            transport=self.transport,
+            transport=NoCookieTransport(transport),
         )
 
     @asynccontextmanager
@@ -190,11 +207,14 @@ class TargetRegistry:
             validate_cursor(query["cursor"])
         credentials = self.credentials.resolve(target, caller)
         breaker = self.breakers.setdefault(target, Breaker())
-        if (
-            breaker.opened_at is not None
-            and self.clock() - breaker.opened_at < self.settings.breaker_cooldown
-        ):
-            raise Unavailable("Target circuit breaker is open")
+        probe = False
+        if breaker.opened_at is not None:
+            if self.clock() - breaker.opened_at < self.settings.breaker_cooldown:
+                raise Unavailable("Target circuit breaker is open")
+            if target in self.breaker_probes:
+                raise Unavailable("Target recovery probe is already in progress")
+            self.breaker_probes.add(target)
+            probe = True
         try:
             async with asyncio.timeout(self.settings.timeout):
                 result = await self._get(target, path, credentials, query)
@@ -204,10 +224,17 @@ class TargetRegistry:
         except Unavailable:
             self._failed(breaker)
             raise
+        except BaseException:
+            if probe:
+                self.breaker_probes.discard(target)
+            raise
         else:
             breaker.failures = 0
             breaker.opened_at = None
             return result
+        finally:
+            if probe:
+                self.breaker_probes.discard(target)
 
     def _failed(self, breaker: Breaker) -> None:
         breaker.failures += 1
@@ -278,7 +305,7 @@ class TargetRegistry:
                     delay = (parsedate_to_datetime(retry_after) - datetime.now(UTC)).total_seconds()
                 except (ValueError, TypeError, OverflowError):
                     delay = 0
-            return max(0, delay)
+            return min(max(0, delay), 8)
         return min(2**attempt, 8) + random.uniform(0, 0.25)
 
     async def authenticate(self, target: str, caller: Caller) -> str:

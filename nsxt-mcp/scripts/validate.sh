@@ -33,7 +33,8 @@ uv run --project "$ROOT" mypy "$ROOT/src/nsxt_mcp" "$ROOT/examples/mcp_client.py
 progress 5 'Python compilation'
 uv run --project "$ROOT" python -m compileall -q "$ROOT/src" "$ROOT/tests" "$ROOT/examples"
 progress 6 'Stub-backed unit and MCP transport tests'
-uv run --project "$ROOT" pytest "$ROOT/tests" -v
+uv run --project "$ROOT" pytest "$ROOT/tests" -v \
+  --cov=nsxt_mcp --cov-report=term-missing --cov-fail-under=90
 if "$CONTAINER"; then
   bash "$ROOT/scripts/container-smoke.sh"
 fi

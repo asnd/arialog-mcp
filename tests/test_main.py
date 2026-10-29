@@ -87,6 +87,7 @@ class FakeServer:
                 "ARIALOG_HTTP_HOST": "0.0.0.0",
                 "ARIALOG_HTTP_PORT": "9000",
                 "ARIALOG_HTTP_AUTH_TOKEN": "t" * 32,
+                "ARIALOG_HTTP_BEHIND_TLS_PROXY": "true",
             },
             ((), {"transport": "http", "host": "0.0.0.0", "port": 9000}),
         ),
@@ -105,7 +106,12 @@ def test_main_selects_transport(monkeypatch, restore_logging, extra, expected):
 
 
 def test_main_reports_model_level_config_error(monkeypatch, capsys):
-    for k, v in {**ENV, "ARIALOG_TRANSPORT": "http", "ARIALOG_HTTP_HOST": "0.0.0.0"}.items():
+    for k, v in {
+        **ENV,
+        "ARIALOG_TRANSPORT": "http",
+        "ARIALOG_HTTP_HOST": "0.0.0.0",
+        "ARIALOG_HTTP_BEHIND_TLS_PROXY": "true",
+    }.items():
         monkeypatch.setenv(k, v)
     with pytest.raises(SystemExit) as ei:
         entry.main()

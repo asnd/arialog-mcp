@@ -57,6 +57,9 @@ class Settings(BaseSettings):
     # --- response limits (what the LLM may receive) ------------------------
     max_events: int = Field(200, ge=1)
     max_bytes: int = Field(60_000, ge=1_000)
+    max_response_bytes: int = Field(1_000_000, ge=1_000)
+    max_event_fields: int = Field(50, ge=1, le=500)
+    max_event_field_chars: int = Field(500, ge=1, le=10_000)
     max_text_chars: int = Field(1_000, ge=50)
     signature_scan_limit: int = Field(2_000, ge=1)
     max_bins: int = Field(144, ge=8)
@@ -75,6 +78,11 @@ class Settings(BaseSettings):
     http_auth_mode: AuthMode = "none"
     http_auth_token: SecretStr | None = None
     http_allow_unauthenticated: bool = False
+    http_behind_tls_proxy: bool = False
+    caller_requests_per_minute: int = Field(120, ge=1)
+    caller_burst: int = Field(20, ge=1)
+    max_callers: int = Field(1000, ge=1)
+    caller_idle_seconds: float = Field(600.0, gt=0)
     log_level: str = "INFO"
 
     # --- LDAP (http_auth_mode=ldap) -----------------------------------------
@@ -98,6 +106,8 @@ class Settings(BaseSettings):
     # ldap_failed_bind_cooldown_s, so the MCP cannot be used to lock out AD accounts.
     ldap_max_failed_binds: int = Field(5, ge=1)
     ldap_failed_bind_cooldown_s: float = Field(300.0, ge=0)
+    ldap_bind_requests_per_minute: int = Field(120, ge=1)
+    ldap_bind_burst: int = Field(20, ge=1)
     # VRLI login name for an LDAP user; "{username}" is the HTTP Basic user name.
     ldap_vrli_username_template: str = "{username}"
 
@@ -163,12 +173,13 @@ class Settings(BaseSettings):
             self._check_ldap()
         elif self.username is None or self.password is None:
             raise ValueError("username and password (VRLI service account) are required")
-        if (
-            self.transport == "http"
-            and mode == "none"
-            and not self.http_allow_unauthenticated
-            and not _is_loopback(self.http_host)
-        ):
+        remote_http = self.transport == "http" and not _is_loopback(self.http_host)
+        if remote_http and not self.http_behind_tls_proxy:
+            raise ValueError(
+                "non-loopback HTTP requires http_behind_tls_proxy=true "
+                "(or a future direct-TLS transport)"
+            )
+        if remote_http and mode == "none" and not self.http_allow_unauthenticated:
             raise ValueError(
                 "http_auth_mode token or ldap is required when http_host is not loopback "
                 "(or set http_allow_unauthenticated=true behind an authenticating proxy)"

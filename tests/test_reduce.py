@@ -1,4 +1,11 @@
-from arialog_mcp.reduce import RawEvent, cap_events, group_signatures, mask, zscores
+from arialog_mcp.reduce import (
+    RawEvent,
+    cap_events,
+    group_signatures,
+    mask,
+    sanitize_event,
+    zscores,
+)
 
 
 def test_mask_collapses_variable_parts():
@@ -44,3 +51,24 @@ def test_cap_events_by_count_bytes_and_line_length():
     assert len(kept) < 10 and "byte budget" in (why or "")
     kept, why = cap_events(evs[:2], limit=10, max_bytes=10_000, max_text_chars=500)
     assert len(kept) == 2 and why is None
+
+
+def test_sensitive_credentials_are_redacted_from_event_text_and_fields():
+    event = sanitize_event(
+        RawEvent(
+            1,
+            'password="topsecret" Authorization: Bearer abc123 https://u:p@host',
+            {"api_token": "private", "hostname": "node-a"},
+        )
+    )
+    assert "topsecret" not in event.text
+    assert "abc123" not in event.text
+    assert "u:p" not in event.text
+    assert event.fields == {"api_token": "[redacted]", "hostname": "node-a"}
+
+
+def test_byte_budget_counts_event_fields():
+    events = [RawEvent(1, "short", {"description": "x" * 1000})]
+    kept, reason = cap_events(events, limit=10, max_bytes=200, max_text_chars=1000)
+    assert kept == []
+    assert reason == "byte budget of 200 reached"

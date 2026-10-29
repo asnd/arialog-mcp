@@ -96,10 +96,10 @@ bash scripts/validate.sh --container
 The first command includes example-client type/syntax checks and example tests.
 The second also rebuilds the image and runs both remote credential modes over TLS,
 including the documented Python client with environment and password-file credentials.
-No real LDAP or NSX installation is needed. Appliance load/performance behavior,
+The unit run enforces the measured 90% line-coverage floor, also enforced in CI
+for Python 3.11–3.13. No real LDAP or NSX installation is needed. Appliance load/performance behavior,
 all 4.x patch versions, and every third-party desktop client remain unverified.
 
-Latest local result (2026-10-23): **167 tests passed**, including the additional
-boundary and example-client tests. Lint, formatting, mypy and compilation passed.
-The rebuilt Podman image and all container smoke scenarios passed, including
-the documented remote client using both credential-file approaches over real TLS.
+Local appliance compatibility remains pending: the tests use deterministic stubs,
+including real HTTP MCP clients and TLS container smoke tests. CI coverage measures
+Python implementation paths, not contract compatibility with a deployed NSX appliance.

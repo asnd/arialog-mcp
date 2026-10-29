@@ -35,6 +35,17 @@ def with_login(get: Callable[[httpx.Request], httpx.Response]) -> Handler:
     return handler
 
 
+async def test_upstream_response_is_bounded_before_json_parsing(clock: FakeClock):
+    client = build(
+        clock,
+        lambda req: httpx.Response(200, content=b"x" * 1001),
+        max_response_bytes=1000,
+    )
+    with pytest.raises(UnavailableError, match="byte limit"):
+        await client.version()
+    await client.aclose()
+
+
 @pytest.mark.parametrize(
     "login,exc,match",
     [

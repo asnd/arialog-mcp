@@ -40,7 +40,8 @@ uv run nsxt-mcp --config examples/shared.json
 
 Set `NSXT_SERVICE_USER` and `NSXT_SERVICE_PASSWORD` in the process environment,
 or reference a mounted password file using `password_file` instead of
-`password_env`. Credentials must have read permission in NSX. A local username
+`password_env`. Password files must be regular files with owner-only permissions
+and no more than 4 KiB. Credentials must have read permission in NSX. A local username
 or LDAP username (for example `reader@example.test`) is sent unchanged using
 Basic authentication over verified HTTPS. NSX performs credential validation.
 
@@ -147,6 +148,8 @@ objects at target/tool-group granularity, not individual policies inside a targe
   execution. The bounded caller table prunes idle entries; login aliases also consume
   the canonical identity's budget so case/domain aliases do not evade that budget.
   Aliases may occupy an additional bounded counter entry. Limits are per process.
+- A separate process-wide pre-authentication token bucket limits username spraying
+  before NSX identity discovery.
 - Authentication and whole-request deadlines, request-body limits, and existing
   NSX global/target limits remain in force. Responses use `Cache-Control: no-store`.
 - Wrong credentials return 401, admission denial 403, caller budget exhaustion 429,
@@ -180,6 +183,8 @@ Exhausting the page count returns `complete=false` and `next_cursor`.
 
 Ambient proxy environment variables are intentionally ignored so configured NSX
 credentials go directly to configured origins. Redirects are not followed.
+Shared target clients discard both incoming `Cookie` headers and upstream
+`Set-Cookie` headers so concurrent requests cannot share appliance session state.
 
 ## Endpoint contract / compatibility manifest
 

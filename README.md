@@ -39,8 +39,10 @@ configuration exits with code 2 and names the offending setting (never its value
 
 Setting only `ARIALOG_HTTP_AUTH_TOKEN` keeps enabling `token` mode (pre-LDAP behaviour).
 Binding a non-loopback address (e.g. `0.0.0.0`, as the container image does) **refuses to start
-in `none` mode**, unless `ARIALOG_HTTP_ALLOW_UNAUTHENTICATED=true` is set because an
-authenticating reverse proxy sits in front. Running unauthenticated logs a warning.
+unless `ARIALOG_HTTP_BEHIND_TLS_PROXY=true` acknowledges that TLS terminates at a trusted
+reverse proxy**. This applies in every authentication mode because bearer and LDAP credentials
+must not cross an unencrypted network. `none` mode additionally requires
+`ARIALOG_HTTP_ALLOW_UNAUTHENTICATED=true` behind an authenticating proxy.
 
 ### LDAP mode (compatible with ariaops-mcp)
 Same semantics and value formats as ariaops-mcp's `ARIAOPS_HTTP_AUTH_MODE=ldap`, with the
@@ -83,7 +85,8 @@ ARIALOG_LDAP_GROUP_ROLE_MAP='{"vrops-ops": {"role": "ops"}, "vrops-se": {"role":
   breaker is open, i.e. VRLI is failing).
 
 ```bash
-podman run -d -p 8000:8000 --env-file .env -e ARIALOG_HTTP_AUTH_TOKEN="$(openssl rand -hex 32)" \
+podman run -d -p 8000:8000 --env-file .env -e ARIALOG_HTTP_BEHIND_TLS_PROXY=true \
+  -e ARIALOG_HTTP_AUTH_TOKEN="$(openssl rand -hex 32)" \
   localhost/arialog-mcp:0.1.0
 ```
 
@@ -115,7 +118,8 @@ podman run -d -p 8000:8000 --env-file .env -e ARIALOG_HTTP_AUTH_TOKEN="$(openssl
 ## Develop
 Hermetic container run (ruff + mypy + pytest, `--network none`): `scripts/test-podman.sh`; full stack with the VRLI stub and an OpenLDAP container (LDAPS, LDAP-mode passthrough):
 `scripts/e2e.sh`.
-CI (`.github/workflows/ci.yml`) runs lint, format check, mypy and pytest on Python 3.11–3.13 and builds the image.
+CI (`.github/workflows/ci.yml`) validates both packages on Python 3.11–3.13,
+enforces a 90% NSX line-coverage floor, and builds the Aria image.
 
 ```bash
 uv run ruff check . && uv run ruff format --check . && uv run mypy && NO_PROXY=127.0.0.1,localhost uv run pytest

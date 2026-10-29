@@ -215,6 +215,7 @@ async def test_structured_results_validate_against_advertised_schemas(settings, 
 def test_password_file_preserves_spaces_unicode_and_colons(settings, caller, tmp_path):
     password = tmp_path / "nsx.password"
     password.write_bytes("  pāss:word=#$  \r\n".encode())
+    password.chmod(0o600)
     settings.credential_profiles["service"] = CredentialProfile(
         username_env="TEST_NSX_USER", password_file=password
     )
@@ -222,11 +223,26 @@ def test_password_file_preserves_spaces_unicode_and_colons(settings, caller, tmp
     assert credentials.password.get_secret_value() == "  pāss:word=#$  "
 
 
+def test_password_file_requires_private_mode_and_bounded_size(settings, caller, tmp_path):
+    password = tmp_path / "password"
+    password.write_text("secret")
+    settings.credential_profiles["service"] = CredentialProfile(
+        username_env="TEST_NSX_USER", password_file=password
+    )
+    with pytest.raises(AuthenticationFailed, match="private regular file"):
+        CredentialProvider(settings).resolve("a", caller)
+    password.chmod(0o600)
+    password.write_text("x" * 4097)
+    with pytest.raises(AuthenticationFailed, match="size limit"):
+        CredentialProvider(settings).resolve("a", caller)
+
+
 @pytest.mark.parametrize("content", [None, b"", b"\xff"])
 def test_missing_empty_or_invalid_password_file_is_sanitized(settings, caller, tmp_path, content):
     password = tmp_path / "private-secret-path"
     if content is not None:
         password.write_bytes(content)
+        password.chmod(0o600)
     settings.credential_profiles["service"] = CredentialProfile(
         username_env="TEST_NSX_USER", password_file=password
     )
