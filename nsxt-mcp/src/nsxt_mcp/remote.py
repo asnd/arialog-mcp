@@ -94,6 +94,21 @@ class RemoteApp:
         self.registry = registry
         self.settings = registry.settings.remote
         self.limits = CallerLimits(self.settings)
+        self.pre_auth_tokens = float(self.settings.burst)
+        self.pre_auth_updated = time.monotonic()
+
+    def allow_auth_attempt(self) -> bool:
+        now = time.monotonic()
+        self.pre_auth_tokens = min(
+            self.settings.burst,
+            self.pre_auth_tokens
+            + max(0.0, now - self.pre_auth_updated) * self.settings.requests_per_minute / 60,
+        )
+        self.pre_auth_updated = now
+        if self.pre_auth_tokens < 1:
+            return False
+        self.pre_auth_tokens -= 1
+        return True
 
     async def reject(
         self, scope: Scope, receive: Receive, send: Send, status: int, message: str
@@ -132,6 +147,9 @@ class RemoteApp:
             await self.reject(scope, receive, send, 401, "Basic credentials required")
             return
         username = credentials.username.get_secret_value()
+        if not self.allow_auth_attempt():
+            await self.reject(scope, receive, send, 429, "Authentication request budget exceeded")
+            return
         identity = f"{self.settings.realm}/{username}"
         if not self.limits.enter(identity):
             await self.reject(scope, receive, send, 429, "Caller request budget exceeded")

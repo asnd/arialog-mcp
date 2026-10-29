@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+
 import httpx
 import pytest
 
@@ -63,6 +65,39 @@ async def test_breaker_opens_then_half_opens(client: VRLIClient, stub: Stub, clo
     await stub.faults(unavailable_next=0)
     clock.advance(31)
     assert (await client.events(HOUR, limit=1)).events
+
+
+async def test_breaker_allows_only_one_half_open_probe(clock: FakeClock):
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    calls = 0
+
+    async def handler(request):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return httpx.Response(503)
+        entered.set()
+        await release.wait()
+        return httpx.Response(200, json={"version": "8.18"})
+
+    client = VRLIClient(
+        make_settings(retries=0, breaker_failures=1),
+        transport=httpx.MockTransport(handler),
+        sleep=no_sleep,
+        clock=clock,
+    )
+    with pytest.raises(UnavailableError):
+        await client.version()
+    clock.advance(31)
+    probe = asyncio.create_task(client.version())
+    await entered.wait()
+    with pytest.raises(BreakerOpenError, match="already in progress"):
+        await client.version()
+    release.set()
+    assert await probe == {"version": "8.18"}
+    assert calls == 2
+    await client.aclose()
 
 
 async def test_bad_credentials_do_not_hammer_ad(stub: Stub, clock: FakeClock):

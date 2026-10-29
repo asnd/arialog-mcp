@@ -19,8 +19,10 @@ import contextlib
 import hashlib
 import hmac
 import logging
+import re
 import secrets
 import ssl
+import threading
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -44,6 +46,7 @@ OPS_ROLE = "ops"
 COUNTRY_ROLE = "country"
 REALM = "arialog-mcp"
 _MAX_TRACKED = 1000  # cache / failure-counter entries before expired ones are swept
+_USERNAME_RE = re.compile(r"^[A-Za-z0-9._@-]{1,128}$")
 
 
 # ------------------------------------------------------------------ group mapping
@@ -129,6 +132,8 @@ class LDAPAuthenticator:
         cache_ttl: int = 300,
         max_failed_binds: int = 5,
         failed_bind_cooldown_s: float = 300.0,
+        bind_requests_per_minute: int = 120,
+        bind_burst: int = 20,
         connector: Connector | None = None,
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
@@ -143,12 +148,19 @@ class LDAPAuthenticator:
         self.cache_ttl = cache_ttl
         self._max_failed = max_failed_binds
         self._fail_cooldown = failed_bind_cooldown_s
+        self._bind_rate = bind_requests_per_minute / 60
+        self._bind_burst = bind_burst
         self._connector = connector or self._ldap3_connect
         self._clock = clock
         self._cache: dict[str, tuple[dict[str, str], float]] = {}
         self._failures: dict[str, _Failures] = {}
+        self._inflight: dict[str, int] = {}
+        self._state_lock = asyncio.Lock()
+        self._bind_tokens = float(bind_burst)
+        self._bind_updated = clock()
         self._hmac_key = secrets.token_bytes(32)
         self._server: Any = None
+        self._server_lock = threading.Lock()
 
     @classmethod
     def from_settings(cls, s: Settings, **kw: Any) -> LDAPAuthenticator:
@@ -165,6 +177,8 @@ class LDAPAuthenticator:
             cache_ttl=s.ldap_cache_ttl,
             max_failed_binds=s.ldap_max_failed_binds,
             failed_bind_cooldown_s=s.ldap_failed_bind_cooldown_s,
+            bind_requests_per_minute=s.ldap_bind_requests_per_minute,
+            bind_burst=s.ldap_bind_burst,
             **kw,
         )
 
@@ -173,22 +187,24 @@ class LDAPAuthenticator:
         from ldap3 import Connection, Server, Tls
         from ldap3.core.exceptions import LDAPCommunicationError
 
-        if self._server is None:
-            use_ssl = self._server_uri.lower().startswith("ldaps://")
-            tls = (
-                Tls(
-                    ca_certs_file=self._ca_cert_file,
-                    validate=ssl.CERT_REQUIRED if self._verify_tls else ssl.CERT_NONE,
+        with self._server_lock:
+            if self._server is None:
+                use_ssl = self._server_uri.lower().startswith("ldaps://")
+                tls = (
+                    Tls(
+                        ca_certs_file=self._ca_cert_file,
+                        validate=ssl.CERT_REQUIRED if self._verify_tls else ssl.CERT_NONE,
+                    )
+                    if use_ssl
+                    else None
                 )
-                if use_ssl
-                else None
-            )
-            self._server = Server(
-                self._server_uri, use_ssl=use_ssl, tls=tls, connect_timeout=self._bind_timeout
-            )
+                self._server = Server(
+                    self._server_uri, use_ssl=use_ssl, tls=tls, connect_timeout=self._bind_timeout
+                )
+            server = self._server
         try:
             return Connection(
-                self._server,
+                server,
                 user=bind_dn,
                 password=password,
                 auto_bind=True,
@@ -203,7 +219,9 @@ class LDAPAuthenticator:
         except LDAPCommunicationError:
             # ldap3's Server remembers failed addresses and then refuses them ("invalid
             # server address"), so one outage would outlive the directory's recovery.
-            self._server = None
+            with self._server_lock:
+                if self._server is server:
+                    self._server = None
             raise
 
     def _bind_and_groups(self, username: str, password: str) -> list[str] | None:
@@ -225,18 +243,29 @@ class LDAPAuthenticator:
             raise DirectoryUnavailableError(f"{type(exc).__name__}: {str(exc)[:300]}") from exc
         try:
             # Escaped so a crafted username cannot widen the filter to another entry.
-            user, dn = escape_filter_chars(username), escape_filter_chars(bind_dn)
-            conn.search(
-                search_base=self._search_base,
-                search_filter=(
-                    f"(|(userPrincipalName={user})(sAMAccountName={user})"
-                    f"(uid={user})(distinguishedName={dn}))"
-                ),
-                attributes=["memberOf"],
-            )
+            dn = escape_filter_chars(bind_dn)
+            if "=" in bind_dn:
+                from ldap3 import BASE
+
+                conn.search(
+                    search_base=bind_dn,
+                    search_filter="(objectClass=*)",
+                    search_scope=BASE,
+                    attributes=["memberOf"],
+                )
+            else:
+                conn.search(
+                    search_base=self._search_base,
+                    search_filter=f"(userPrincipalName={dn})",
+                    attributes=["memberOf"],
+                )
+            if len(conn.entries) > 1:
+                raise DirectoryUnavailableError("bound identity matched multiple directory entries")
             if not conn.entries:
                 return []
             entry = conn.entries[0]
+            if "=" in bind_dn and entry.entry_dn.lower() != bind_dn.lower():
+                raise DirectoryUnavailableError("directory returned a different bound identity")
             raw = entry.memberOf.values if "memberOf" in entry and entry.memberOf else []
             return [str(g) for g in raw]
         except LDAPException as exc:
@@ -281,7 +310,7 @@ class LDAPAuthenticator:
     async def authenticate(self, username: str, password: str) -> dict[str, str] | None:
         """Mapped claims for a valid, authorised user; otherwise None."""
         if not username or not password:
-            return None  # an empty password is an anonymous bind (RFC 4513 §5.1.2)
+            return None
         now = self._clock()
         key = self._key(username, password)
         hit = self._cache.get(key)
@@ -290,24 +319,50 @@ class LDAPAuthenticator:
                 return hit[0]
             del self._cache[key]
         who = username.lower()
-        state = self._failures.get(who)
-        if state is not None and state.blocked_until > now:
-            log.info(
-                "ldap bind refused (throttled)", extra={"event": "ldap_throttled", "user": username}
-            )
-            return None
+        async with self._state_lock:
+            elapsed = max(0.0, now - self._bind_updated)
+            self._bind_tokens = min(self._bind_burst, self._bind_tokens + elapsed * self._bind_rate)
+            self._bind_updated = now
+            if self._bind_tokens < 1:
+                log.info("ldap bind rate limited", extra={"event": "ldap_rate_limited"})
+                return None
+            self._bind_tokens -= 1
+            if not _USERNAME_RE.fullmatch(username):
+                return None
+            state = self._failures.get(who)
+            inflight = self._inflight.get(who, 0)
+            failure_count = state.count if state is not None else 0
+            if (state is not None and state.blocked_until > now) or (
+                failure_count + inflight >= self._max_failed
+            ):
+                log.info(
+                    "ldap bind refused (throttled)",
+                    extra={"event": "ldap_throttled", "user": username},
+                )
+                return None
+            self._inflight[who] = inflight + 1
         try:
             groups = await asyncio.to_thread(self._bind_and_groups, username, password)
         except DirectoryUnavailableError as exc:
             log.error(
                 "ldap directory unavailable", extra={"event": "ldap_unavailable", "error": str(exc)}
             )
-            return None
-        if groups is None:
-            self._record_failure(who, now)
-            log.info("ldap bind rejected", extra={"event": "ldap_bind_failed", "user": username})
-            return None
-        self._failures.pop(who, None)
+            raise
+        finally:
+            async with self._state_lock:
+                count = self._inflight.get(who, 1) - 1
+                if count:
+                    self._inflight[who] = count
+                else:
+                    self._inflight.pop(who, None)
+        async with self._state_lock:
+            if groups is None:
+                self._record_failure(who, now)
+                log.info(
+                    "ldap bind rejected", extra={"event": "ldap_bind_failed", "user": username}
+                )
+                return None
+            self._failures.pop(who, None)
         claims = self._claims(groups)
         if claims is None:
             log.info(
@@ -358,11 +413,17 @@ class BasicLDAPAuthBackend(AuthenticationBackend):
     async def authenticate(
         self, conn: HTTPConnection
     ) -> tuple[AuthCredentials, AuthenticatedUser] | None:
-        creds = _parse_basic(conn.headers.get("authorization", ""))
+        state = conn.scope.get("state", {})
+        raw_header = state.pop("ldap_basic_authorization", conn.headers.get("authorization", ""))
+        creds = _parse_basic(raw_header)
         if creds is None:
             return None
         username, password = creds
-        claims = await self._authn.authenticate(username, password)
+        try:
+            claims = await self._authn.authenticate(username, password)
+        except DirectoryUnavailableError:
+            conn.scope.setdefault("state", {})["ldap_directory_unavailable"] = True
+            return None
         if claims is None:
             return None
         token = UserAccessToken(
@@ -388,7 +449,42 @@ class BasicChallengeMiddleware:
             await self.app(scope, receive, send)
             return
 
+        scope = dict(scope)
+        headers = list(scope.get("headers", []))
+        basic_header = next(
+            (value for key, value in headers if key.lower() == b"authorization"), None
+        )
+        if basic_header is not None and basic_header[:6].lower() == b"basic ":
+            scope.setdefault("state", {})["ldap_basic_authorization"] = basic_header.decode(
+                "latin-1"
+            )
+            scope["headers"] = [
+                (key, b"Bearer ldap" if key.lower() == b"authorization" else value)
+                for key, value in headers
+            ]
+
+        response_unavailable = False
+
         async def send_wrapper(message: Message) -> None:
+            nonlocal response_unavailable
+            if (
+                scope.get("state", {}).get("ldap_directory_unavailable", False)
+                and message["type"] == "http.response.start"
+                and message["status"] == 401
+            ):
+                response_unavailable = True
+                headers = [
+                    (k, v)
+                    for k, v in message.get("headers", [])
+                    if k.lower() not in (b"www-authenticate", b"content-length")
+                ]
+                headers.extend(
+                    [
+                        (b"content-type", b"application/json"),
+                        (b"content-length", b"39"),
+                    ]
+                )
+                message = {**message, "status": 503, "headers": headers}
             if message["type"] == "http.response.start" and message["status"] == 401:
                 headers = [
                     (k, v)
@@ -397,6 +493,12 @@ class BasicChallengeMiddleware:
                 ]
                 headers.append((b"www-authenticate", f'Basic realm="{REALM}"'.encode()))
                 message = {**message, "headers": headers}
+            elif response_unavailable and message["type"] == "http.response.body":
+                message = {
+                    **message,
+                    "body": b'{"detail":"LDAP directory unavailable"}',
+                    "more_body": False,
+                }
             await send(message)
 
         await self.app(scope, receive, send_wrapper)

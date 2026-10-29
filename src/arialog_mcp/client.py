@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import hmac
+import json
 import logging
 import random
 import secrets
@@ -86,17 +87,22 @@ class CircuitBreaker:
         self._clock = clock
         self._failures = 0
         self._opened_at: float | None = None
+        self._probe_in_flight = False
+        self._lock = asyncio.Lock()
 
-    def before(self) -> None:
-        if self._opened_at is None:
-            return
-        remaining = self._cooldown - (self._clock() - self._opened_at)
-        if remaining > 0:
-            raise BreakerOpenError(
-                f"VRLI marked unavailable after repeated failures; retry in {remaining:.0f}s"
-            )
-        self._opened_at = None  # half-open: let one request through
-        self._failures = self._threshold - 1
+    async def before(self) -> None:
+        async with self._lock:
+            if self._opened_at is None:
+                return
+            remaining = self._cooldown - (self._clock() - self._opened_at)
+            if remaining > 0:
+                raise BreakerOpenError(
+                    f"VRLI marked unavailable after repeated failures; retry in {remaining:.0f}s"
+                )
+            if self._probe_in_flight:
+                raise BreakerOpenError("VRLI recovery probe is already in progress")
+            self._probe_in_flight = True
+            self._failures = self._threshold - 1
 
     @property
     def is_open(self) -> bool:
@@ -105,11 +111,16 @@ class CircuitBreaker:
     def success(self) -> None:
         self._failures = 0
         self._opened_at = None
+        self._probe_in_flight = False
 
     def failure(self) -> None:
+        self._probe_in_flight = False
         self._failures += 1
         if self._failures >= self._threshold:
             self._opened_at = self._clock()
+
+    def abandon_probe(self) -> None:
+        self._probe_in_flight = False
 
 
 class VRLIClient:
@@ -211,23 +222,22 @@ class VRLIClient:
             "provider": self._s.provider,
         }
         try:
-            resp = await self._http.post("/api/v2/sessions", json=body)
+            code, headers, content = await self._request("POST", "/api/v2/sessions", json=body)
         except httpx.HTTPError as exc:
             raise UnavailableError(
                 f"VRLI unavailable: login failed ({type(exc).__name__})"
             ) from exc
-        if resp.status_code in (401, 403):
+        if code in (401, 403):
             self._block(sess, now + self._s.login_cooldown_s)
             raise AuthError(
-                f"VRLI rejected the credentials for provider {self._s.provider} "
-                f"(HTTP {resp.status_code})"
+                f"VRLI rejected the credentials for provider {self._s.provider} (HTTP {code})"
             )
-        if resp.status_code in RETRY_STATUS or resp.status_code >= 500:
-            raise UnavailableError(f"VRLI login unavailable (HTTP {resp.status_code})")
-        if resp.status_code >= 400:
-            raise AuthError(f"VRLI login refused (HTTP {resp.status_code})")
+        if code in RETRY_STATUS or code >= 500:
+            raise UnavailableError(f"VRLI login unavailable (HTTP {code})")
+        if code >= 400:
+            raise AuthError(f"VRLI login refused (HTTP {code})")
         try:
-            data = resp.json()
+            data = json.loads(content)
             token = str(data["sessionId"])
             ttl = float(data.get("ttl", DEFAULT_SESSION_TTL_S))
         except (ValueError, KeyError, TypeError) as exc:
@@ -265,7 +275,7 @@ class VRLIClient:
         creds: Credentials | None = None,
     ) -> Any:
         sess = self._session(creds) if auth else None  # fail closed before any I/O
-        self._breaker.before()
+        await self._breaker.before()
         attempt = 0
         relogged = False
         last: ArialogError = UnavailableError("VRLI request failed")
@@ -275,8 +285,9 @@ class VRLIClient:
                 token = await self._bearer(sess) if sess else None
                 headers = {"Authorization": f"Bearer {token}"} if token else {}
                 async with self._sem:
-                    resp = await self._http.get(path, params=params, headers=headers)
-                code = resp.status_code
+                    code, response_headers, content = await self._request(
+                        "GET", path, params=params, headers=headers
+                    )
                 if code == 401 and sess and token and not relogged:
                     self._invalidate(sess, token)
                     relogged = True
@@ -284,21 +295,27 @@ class VRLIClient:
                 if code in (401, 403):
                     raise AuthError(f"VRLI refused the session (HTTP {code})")
                 if code in RETRY_STATUS or code >= 500:
-                    retry_after = _retry_after(resp)
+                    retry_after = _retry_after(response_headers)
                     raise UnavailableError(f"VRLI unavailable (HTTP {code})")
                 if code >= 400:
                     self._breaker.success()  # the appliance is healthy; the query was bad
-                    raise QueryError(f"VRLI rejected the query (HTTP {code}): {_detail(resp)}")
+                    raise QueryError(f"VRLI rejected the query (HTTP {code}): {_detail(content)}")
                 try:
-                    payload = resp.json()
-                except ValueError as exc:
+                    payload = json.loads(content)
+                except (ValueError, UnicodeDecodeError) as exc:
                     raise UnavailableError("VRLI returned a non-JSON response") from exc
                 self._breaker.success()
                 return payload
+            except AuthError:
+                self._breaker.success()
+                raise
             except UnavailableError as exc:  # includes a 503 during login (appliance starting)
                 last = exc
             except httpx.HTTPError as exc:
                 last = UnavailableError(f"VRLI unavailable: request failed ({type(exc).__name__})")
+            except BaseException:
+                self._breaker.abandon_probe()
+                raise
             attempt += 1
             if attempt > self._s.retries:
                 self._breaker.failure()
@@ -309,6 +326,17 @@ class VRLIClient:
                 extra={"event": "retry", "attempt": attempt, "delay_s": delay, "reason": str(last)},
             )
             await self._sleep(delay)
+
+    async def _request(
+        self, method: str, path: str, **kwargs: Any
+    ) -> tuple[int, httpx.Headers, bytes]:
+        async with self._http.stream(method, path, **kwargs) as response:
+            content = bytearray()
+            async for chunk in response.aiter_bytes():
+                if len(content) + len(chunk) > self._s.max_response_bytes:
+                    raise UnavailableError("VRLI response exceeded the configured byte limit")
+                content.extend(chunk)
+            return response.status_code, response.headers, bytes(content)
 
     # ------------------------------------------------------------------ API
     async def version(self) -> dict[str, Any]:
@@ -328,7 +356,14 @@ class VRLIClient:
             creds=creds,
         )
         try:
-            events = [_parse_event(e) for e in data.get("events", [])]
+            events = [
+                _parse_event(
+                    e,
+                    max_fields=self._s.max_event_fields,
+                    max_field_chars=self._s.max_event_field_chars,
+                )
+                for e in data.get("events", [])
+            ]
             return RawEvents(events=events, complete=bool(data.get("complete", True)))
         except (AttributeError, KeyError, TypeError, ValueError) as exc:
             raise UnavailableError("VRLI events response had an unexpected shape") from exc
@@ -357,28 +392,30 @@ class VRLIClient:
             ) from exc
 
 
-def _parse_event(raw: dict[str, Any]) -> RawEvent:
+def _parse_event(
+    raw: dict[str, Any], *, max_fields: int = 50, max_field_chars: int = 500
+) -> RawEvent:
     fields: dict[str, str] = {}
-    for f in raw.get("fields", []) or []:
+    for f in (raw.get("fields", []) or [])[:max_fields]:
         name = f.get("name")
         if name and name not in fields:
-            fields[str(name)] = str(f.get("content", ""))
+            fields[str(name)[:128]] = str(f.get("content", ""))[:max_field_chars]
     return RawEvent(ts_ms=int(raw["timestamp"]), text=str(raw.get("text", "")), fields=fields)
 
 
-def _retry_after(resp: httpx.Response) -> float | None:
+def _retry_after(headers: httpx.Headers) -> float | None:
     """Retry-After in seconds (delta form only; HTTP-date is ignored)."""
-    raw = resp.headers.get("retry-after", "").strip()
+    raw = headers.get("retry-after", "").strip()
     try:
         return max(0.0, float(raw)) if raw else None
     except ValueError:
         return None
 
 
-def _detail(resp: httpx.Response) -> str:
+def _detail(content: bytes) -> str:
     try:
-        body = resp.json()
+        body = json.loads(content)
         msg = body.get("errorMessage") or body.get("message") or ""
-    except (ValueError, AttributeError):
-        msg = resp.text
+    except (ValueError, AttributeError, UnicodeDecodeError):
+        msg = content.decode("utf-8", errors="replace")
     return str(msg)[:200]

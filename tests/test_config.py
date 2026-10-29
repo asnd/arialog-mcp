@@ -62,11 +62,23 @@ def test_numeric_bounds(field, val):
         mk(**{field: val})
 
 
-def test_http_on_non_loopback_requires_a_token():
-    with pytest.raises(ValidationError, match="token or ldap is required"):
+def test_non_loopback_http_requires_tls_proxy_ack_and_authentication():
+    with pytest.raises(ValidationError, match="http_behind_tls_proxy"):
         mk(transport="http", http_host="0.0.0.0")
-    assert mk(transport="http", http_host="0.0.0.0", http_auth_token="x" * 16).http_auth_token
-    assert mk(transport="http", http_host="0.0.0.0", http_allow_unauthenticated=True)
+    with pytest.raises(ValidationError, match="token or ldap is required"):
+        mk(transport="http", http_host="0.0.0.0", http_behind_tls_proxy=True)
+    assert mk(
+        transport="http",
+        http_host="0.0.0.0",
+        http_behind_tls_proxy=True,
+        http_auth_token="x" * 16,
+    ).http_auth_token
+    assert mk(
+        transport="http",
+        http_host="0.0.0.0",
+        http_behind_tls_proxy=True,
+        http_allow_unauthenticated=True,
+    )
     assert mk(transport="http", http_host="127.0.0.1").http_auth_token is None
     assert mk(transport="http", http_host="localhost").http_auth_token is None
     assert mk(transport="http", http_host="::1").http_auth_token is None

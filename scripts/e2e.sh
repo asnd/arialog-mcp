@@ -54,7 +54,8 @@ podman network create "$NET" >/dev/null
 wait_healthy vrli-stub 30
 
 TOKEN="e2e-$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')"   # throwaway bearer token
-COMMON=(-e ARIALOG_HOST=vrli-stub -e ARIALOG_HTTP_AUTH_TOKEN="$TOKEN" -e ARIALOG_USE_TLS=false -e ARIALOG_USERNAME=svc-test
+COMMON=(-e ARIALOG_HOST=vrli-stub -e ARIALOG_HTTP_AUTH_TOKEN="$TOKEN" -e ARIALOG_HTTP_BEHIND_TLS_PROXY=true
+        -e ARIALOG_USE_TLS=false -e ARIALOG_USERNAME=svc-test
         -e ARIALOG_RETRIES=3 -e ARIALOG_BACKOFF_BASE_S=0.1 -e ARIALOG_LOGIN_COOLDOWN_S=300)
 
 progress "arialog-mcp (good credentials)"

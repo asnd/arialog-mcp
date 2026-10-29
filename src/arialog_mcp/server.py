@@ -4,12 +4,11 @@ from __future__ import annotations
 
 import functools
 import hmac
-import json
 import logging
 import time
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
-from datetime import UTC, datetime
+from dataclasses import dataclass
 from typing import Annotated, Any, ParamSpec, TypeVar
 
 from fastmcp import FastMCP
@@ -29,23 +28,11 @@ from .constraints import (
     MAX_FILTERS,
     MAX_TEXT_TERMS,
     Filter,
-    Window,
-    build_constraints,
-    resolve_window,
 )
 from .errors import ArialogError, AuthError
 from .ldap_auth import LDAPAuthenticator, LDAPBasicAuth, UserAccessToken
-from .models import (
-    AggregateResult,
-    Bin,
-    Event,
-    QueryInfo,
-    SearchResult,
-    Signature,
-    SignatureResult,
-    VersionInfo,
-)
-from .reduce import cap_events, group_signatures, zscores
+from .models import AggregateResult, SearchResult, SignatureResult, VersionInfo
+from .service import ArialogService
 
 audit = logging.getLogger("arialog_mcp.audit")
 
@@ -124,37 +111,89 @@ def _caller() -> AccessToken | None:
 class AuditMiddleware(Middleware):
     """One audit line per tool call; domain errors become clean tool errors."""
 
+    def __init__(self, settings: Settings) -> None:
+        self.settings = settings
+        self.callers: dict[str, _CallerBudget] = {}
+
     async def on_call_tool(self, context: MiddlewareContext[Any], call_next: Any) -> Any:
         name = context.message.name
-        args = json.dumps(context.message.arguments or {}, default=str)[:500]
         who = _caller()
-        base: dict[str, Any] = {"tool": name, "tool_args": args}
+        base: dict[str, Any] = {"tool": name}
         if who is not None:
             base["user"] = who.client_id
             if role := (who.claims or {}).get("role"):
                 base["role"] = role
+            if not self._enter(who.client_id):
+                raise ToolError("Caller request budget exceeded")
         t0 = time.monotonic()
         try:
             result = await call_next(context)
         except ToolError as exc:
             # FastMCP wraps whatever the tool raised; classify by the original cause.
             cause = exc.__cause__
-            extra = {**base, "error": str(exc), "ms": _ms(t0)}
+            extra = {**base, "error_type": type(cause).__name__, "ms": _ms(t0)}
             if isinstance(cause, ArialogError):
                 audit.warning("tool failed", extra=extra)
             elif cause is None or isinstance(cause, ValidationError | McpValidationError):
-                audit.warning("tool rejected", extra=extra)  # bad arguments
+                audit.warning("tool rejected", extra=extra)
             else:
                 audit.error("tool crashed", extra=extra, exc_info=exc)
             raise
         except (McpValidationError, ValidationError) as exc:  # bad arguments (caller mistake)
-            audit.warning("tool rejected", extra={**base, "error": str(exc)[:300], "ms": _ms(t0)})
+            audit.warning(
+                "tool rejected",
+                extra={**base, "error_type": type(exc).__name__, "ms": _ms(t0)},
+            )
             raise
         except Exception:
             audit.exception("tool crashed", extra={**base, "ms": _ms(t0)})
             raise
+        finally:
+            if who is not None:
+                self._exit(who.client_id)
         audit.info("tool ok", extra={**base, "ms": _ms(t0)})
         return result
+
+    def _enter(self, identity: str) -> bool:
+        now = time.monotonic()
+        state = self.callers.get(identity)
+        if state is None:
+            expired = [
+                key
+                for key, value in self.callers.items()
+                if not value.active and now - value.updated > self.settings.caller_idle_seconds
+            ]
+            for key in expired:
+                del self.callers[key]
+            if len(self.callers) >= self.settings.max_callers:
+                return False
+            state = self.callers[identity] = _CallerBudget(
+                tokens=float(self.settings.caller_burst), updated=now
+            )
+        state.tokens = min(
+            self.settings.caller_burst,
+            state.tokens
+            + max(0.0, now - state.updated) * self.settings.caller_requests_per_minute / 60,
+        )
+        state.updated = now
+        if state.tokens < 1:
+            return False
+        state.tokens -= 1
+        state.active += 1
+        return True
+
+    def _exit(self, identity: str) -> None:
+        state = self.callers.get(identity)
+        if state is not None:
+            state.active = max(0, state.active - 1)
+            state.updated = time.monotonic()
+
+
+@dataclass
+class _CallerBudget:
+    tokens: float
+    updated: float
+    active: int = 0
 
 
 def _auth_provider(
@@ -171,10 +210,6 @@ def _auth_provider(
 
 def _ms(t0: float) -> int:
     return int((time.monotonic() - t0) * 1000)
-
-
-def _iso(ms: int) -> str:
-    return datetime.fromtimestamp(ms / 1000, tz=UTC).isoformat(timespec="seconds")
 
 
 def create_server(
@@ -197,6 +232,8 @@ def create_server(
         username = settings.ldap_vrli_username_template.replace("{username}", who.client_id)
         return Credentials(username, who.password)
 
+    service = ArialogService(settings, vrli, creds)
+
     @asynccontextmanager
     async def lifespan(_: FastMCP) -> AsyncIterator[None]:
         try:
@@ -209,33 +246,11 @@ def create_server(
         "arialog-mcp",
         version=__version__,
         instructions=INSTRUCTIONS,
-        middleware=[AuditMiddleware()],
+        middleware=[AuditMiddleware(settings)],
         lifespan=lifespan,
         mask_error_details=True,
         auth=_auth_provider(settings, authenticator),
     )
-
-    def prepare(
-        last_minutes: int | None,
-        start: str | None,
-        end: str | None,
-        text_contains: list[str] | None,
-        filters: list[Filter] | None,
-    ) -> tuple[Window, str, list[str]]:
-        window = resolve_window(
-            last_minutes, start, end, now=datetime.now(UTC), max_hours=settings.max_window_hours
-        )
-        path, human = build_constraints(window, text_contains, filters)
-        return window, path, human
-
-    def info(endpoint: str, window: Window, human: list[str]) -> QueryInfo:
-        return QueryInfo(
-            endpoint=endpoint,
-            constraints=human,
-            window_start=window.start.isoformat(timespec="seconds"),
-            window_end=window.end.isoformat(timespec="seconds"),
-            relative_window=window.last_ms is not None,
-        )
 
     @mcp.custom_route("/healthz", methods=["GET"])
     async def healthz(_: Request) -> PlainTextResponse:  # liveness only; never calls VRLI
@@ -251,12 +266,7 @@ def create_server(
     @domain_errors
     async def version() -> VersionInfo:
         """Appliance version (also a cheap reachability probe)."""
-        raw = await vrli.version()
-        return VersionInfo(
-            version=str(raw["version"]) if "version" in raw else None,
-            release=str(raw["releaseName"]) if "releaseName" in raw else None,
-            raw={k: v for k, v in raw.items() if isinstance(v, str | int | float | bool)},
-        )
+        return await service.version()
 
     @mcp.tool(annotations=READ_ONLY)
     @domain_errors
@@ -271,41 +281,13 @@ def create_server(
         ] = None,
     ) -> AggregateResult:
         """Event counts over time bins with spike detection (z-score). Use this FIRST."""
-        window, path, human = prepare(last_minutes, start, end, text_contains, filters)
-        min_bin = max(1, -(-window.seconds // settings.max_bins))  # ceil: never exceed max_bins
-        width = max(bin_seconds or max(10, round(window.seconds / 60 / 10) * 10), min_bin)
-        raw = await vrli.aggregated(path, bin_width_ms=width * 1000, creds=creds())
-        bins_raw = raw.bins[: settings.max_bins]
-        values = [b.value for b in bins_raw]
-        zs = zscores(values)
-        bins = [
-            Bin(
-                start=_iso(b.start_ms),
-                count=int(b.value),
-                zscore=z,
-                spike=z is not None and z >= settings.spike_zscore,
-            )
-            for b, z in zip(bins_raw, zs, strict=True)
-        ]
-        notes: list[str] = []
-        if bin_seconds and bin_seconds < min_bin:
-            notes.append(f"bin_seconds raised to {width} to keep at most {settings.max_bins} bins")
-        if len(raw.bins) > settings.max_bins:
-            notes.append(f"{len(raw.bins) - settings.max_bins} bins dropped (cap)")
-        if not raw.complete:
-            notes.append("VRLI returned a partial result (query timeout); counts may be low")
-        if all(z is None for z in zs):
-            notes.append("spike detection skipped: too few bins or no variance")
-        spikes = [b for b in bins if b.spike]
-        return AggregateResult(
-            query=info("/api/v2/aggregated-events", window, human),
-            bin_seconds=width,
-            total=sum(b.count for b in bins),
-            peak=max(bins, key=lambda b: b.count, default=None),
-            spikes=spikes,
-            bins=bins,
-            complete=raw.complete,
-            notes=notes,
+        return await service.aggregate(
+            last_minutes=last_minutes,
+            start=start,
+            end=end,
+            text_contains=text_contains,
+            filters=filters,
+            bin_seconds=bin_seconds,
         )
 
     @mcp.tool(annotations=READ_ONLY)
@@ -320,44 +302,14 @@ def create_server(
         samples_per_signature: Annotated[int, Field(ge=0, le=3)] = 2,
     ) -> SignatureResult:
         """Group events into message templates (ids/IPs/numbers masked), most frequent first."""
-        window, path, human = prepare(last_minutes, start, end, text_contains, filters)
-        scan = settings.signature_scan_limit
-        raw = await vrli.events(path, limit=scan, creds=creds())
-        groups, distinct = group_signatures(
-            raw.events,
+        return await service.signatures(
+            last_minutes=last_minutes,
+            start=start,
+            end=end,
+            text_contains=text_contains,
+            filters=filters,
             top_n=top_n,
-            samples=samples_per_signature,
-            max_text_chars=settings.max_text_chars,
-        )
-        truncated = len(raw.events) >= scan
-        notes: list[str] = []
-        if truncated:
-            notes.append(
-                f"scan stopped at {scan} events (newest first): counts are lower bounds and the "
-                "older part of the window is not covered; narrow the window or add filters"
-            )
-        if not raw.complete:
-            notes.append("VRLI returned a partial result (query timeout)")
-        return SignatureResult(
-            query=info("/api/v2/events", window, human),
-            scanned=len(raw.events),
-            distinct_signatures=distinct,
-            scan_truncated=truncated,
-            covered_from=_iso(min(e.ts_ms for e in raw.events)) if raw.events else None,
-            complete=raw.complete,
-            signatures=[
-                Signature(
-                    signature_id=g.sig_id,
-                    template=g.template,
-                    count=g.count,
-                    first_seen=_iso(g.first_ms),
-                    last_seen=_iso(g.last_ms),
-                    top_hosts=dict(g.hosts),
-                    samples=g.samples,
-                )
-                for g in groups
-            ],
-            notes=notes,
+            samples_per_signature=samples_per_signature,
         )
 
     @mcp.tool(annotations=READ_ONLY)
@@ -373,32 +325,13 @@ def create_server(
         ] = 50,
     ) -> SearchResult:
         """Raw events, newest first. Capped by count and bytes; use for a few evidence lines."""
-        window, path, human = prepare(last_minutes, start, end, text_contains, filters)
-        applied = min(limit, settings.max_events)
-        raw = await vrli.events(path, limit=applied, creds=creds())
-        kept, reason = cap_events(
-            raw.events,
-            limit=applied,
-            max_bytes=settings.max_bytes,
-            max_text_chars=settings.max_text_chars,
-        )
-        notes: list[str] = []
-        if limit > applied:
-            notes.append(f"limit lowered to the server cap of {applied}")
-        if len(raw.events) >= applied and reason is None:
-            reason = f"limited to {applied} events; more may match"
-        if not raw.complete:
-            notes.append("VRLI returned a partial result (query timeout)")
-        return SearchResult(
-            query=info("/api/v2/events", window, human),
-            returned=len(kept),
-            complete=raw.complete,
-            truncated=reason is not None,
-            truncated_reason=reason,
-            events=[
-                Event(time=_iso(e.ts_ms), host=e.host, text=e.text, fields=e.fields) for e in kept
-            ],
-            notes=notes,
+        return await service.search(
+            last_minutes=last_minutes,
+            start=start,
+            end=end,
+            text_contains=text_contains,
+            filters=filters,
+            limit=limit,
         )
 
     return mcp

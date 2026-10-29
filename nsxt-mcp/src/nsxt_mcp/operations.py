@@ -22,7 +22,23 @@ def redact_secrets(value: Any) -> Any:
     if isinstance(value, dict):
         return {
             key: "[redacted]"
-            if key.lower() in {"password", "passphrase", "secret", "private_key", "shared_secret"}
+            if key.lower().replace("-", "_")
+            in {
+                "password",
+                "passwd",
+                "passphrase",
+                "secret",
+                "private_key",
+                "shared_secret",
+                "client_secret",
+                "api_key",
+                "access_key",
+                "token",
+                "access_token",
+                "authorization",
+                "credential",
+                "credentials",
+            }
             else redact_secrets(item)
             for key, item in value.items()
         }

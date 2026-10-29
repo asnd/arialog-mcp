@@ -4,7 +4,7 @@ import json
 import logging
 import sys
 import time
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
 from typing import Annotated, Any, Literal
 
@@ -72,21 +72,19 @@ def create_server(registry: TargetRegistry, caller: Caller | None = None) -> Fas
     def identity() -> Caller:
         return caller if caller is not None else request_caller()
 
-    groups = {
-        name: "gateway_firewall"
-        for name in (
-            "nsx_list_gateway_firewall_policies",
-            "nsx_get_gateway_firewall_policy",
-            "nsx_list_gateway_firewall_rules",
-            "nsx_get_gateway_firewall_rule_statistics",
-            "nsx_get_group",
-            "nsx_get_group_members",
-            "nsx_get_service",
-            "nsx_resolve_firewall_reference",
-            "nsx_get_realization_status",
-        )
-    }
-    groups.update({"nsx_list_targets": "metadata", "nsx_get_version": "metadata"})
+    groups: dict[str, str] = {}
+
+    def register_tool(
+        group: str, *, timeout: float | None = None
+    ) -> Callable[[Callable[..., Any]], Any]:
+        def register(function: Callable[..., Any]) -> Any:
+            groups[function.__name__] = group
+            options: dict[str, Any] = {"annotations": READ_ONLY}
+            if timeout is not None:
+                options["timeout"] = timeout
+            return server.tool(**options)(function)
+
+        return register
 
     class Guard(Middleware):
         async def on_call_tool(self, context: MiddlewareContext[Any], call_next: Any) -> Any:
@@ -137,12 +135,12 @@ def create_server(registry: TargetRegistry, caller: Caller | None = None) -> Fas
     server = FastMCP("nsxt-mcp", lifespan=lifespan, mask_error_details=True, middleware=[Guard()])
     gateway = GatewayService(registry)
 
-    @server.tool(annotations=READ_ONLY)
+    @register_tool("metadata")
     async def nsx_list_targets() -> list[str]:
         """List configured target aliases accessible to this caller; no network requests."""
         return registry.list_targets(identity())
 
-    @server.tool(annotations=READ_ONLY)
+    @register_tool("metadata")
     async def nsx_get_version(target: str) -> VersionResult:
         """Read the selected NSX Manager version. Requires an explicit target alias."""
         try:
@@ -151,7 +149,7 @@ def create_server(registry: TargetRegistry, caller: Caller | None = None) -> Fas
             raise ToolError(str(exc)) from None
         return VersionResult(target=target, version=version)
 
-    @server.tool(annotations=READ_ONLY, timeout=registry.settings.timeout)
+    @register_tool("gateway_firewall", timeout=registry.settings.timeout)
     async def nsx_list_gateway_firewall_policies(
         target: str,
         ctx: Context,
@@ -172,7 +170,7 @@ def create_server(registry: TargetRegistry, caller: Caller | None = None) -> Fas
             progress=lambda done, total: ctx.report_progress(done, total),
         )
 
-    @server.tool(annotations=READ_ONLY, timeout=registry.settings.timeout)
+    @register_tool("gateway_firewall", timeout=registry.settings.timeout)
     async def nsx_get_gateway_firewall_policy(
         target: str,
         policy_id: str,
@@ -181,7 +179,7 @@ def create_server(registry: TargetRegistry, caller: Caller | None = None) -> Fas
         """Read one Gateway Firewall policy including category, sequence and scope."""
         return await gateway.policy(target, identity(), domain_id, policy_id)
 
-    @server.tool(annotations=READ_ONLY, timeout=registry.settings.timeout)
+    @register_tool("gateway_firewall", timeout=registry.settings.timeout)
     async def nsx_list_gateway_firewall_rules(
         target: str,
         policy_id: str,
@@ -204,7 +202,7 @@ def create_server(registry: TargetRegistry, caller: Caller | None = None) -> Fas
             progress=lambda done, total: ctx.report_progress(done, total),
         )
 
-    @server.tool(annotations=READ_ONLY, timeout=registry.settings.timeout)
+    @register_tool("gateway_firewall", timeout=registry.settings.timeout)
     async def nsx_get_gateway_firewall_rule_statistics(
         target: str,
         policy_id: str,
@@ -217,7 +215,7 @@ def create_server(registry: TargetRegistry, caller: Caller | None = None) -> Fas
             target, identity(), domain_id, policy_id, rule_id, enforcement_point_path
         )
 
-    @server.tool(annotations=READ_ONLY, timeout=registry.settings.timeout)
+    @register_tool("gateway_firewall", timeout=registry.settings.timeout)
     async def nsx_get_group(
         target: str,
         group_id: str,
@@ -232,7 +230,7 @@ def create_server(registry: TargetRegistry, caller: Caller | None = None) -> Fas
             {"domain_id": domain_id, "group_id": group_id},
         )
 
-    @server.tool(annotations=READ_ONLY, timeout=registry.settings.timeout)
+    @register_tool("gateway_firewall", timeout=registry.settings.timeout)
     async def nsx_get_group_members(
         target: str,
         group_id: str,
@@ -259,21 +257,21 @@ def create_server(registry: TargetRegistry, caller: Caller | None = None) -> Fas
             progress=lambda done, total: ctx.report_progress(done, total),
         )
 
-    @server.tool(annotations=READ_ONLY, timeout=registry.settings.timeout)
+    @register_tool("gateway_firewall", timeout=registry.settings.timeout)
     async def nsx_get_service(target: str, service_id: str) -> Detail[PolicyObject]:
         """Read a service and its protocol/port entries by ID."""
         return await gateway.detail(
             target, identity(), "service", PolicyObject, {"service_id": service_id}
         )
 
-    @server.tool(annotations=READ_ONLY, timeout=registry.settings.timeout)
+    @register_tool("gateway_firewall", timeout=registry.settings.timeout)
     async def nsx_resolve_firewall_reference(target: str, path: str) -> Detail[PolicyObject]:
         """Resolve a local domain-group or service policy path from a rule. ANY is a literal,
         not a resource; gateway-local legacy group paths and external URLs are not followed.
         """
         return await gateway.reference(target, identity(), path)
 
-    @server.tool(annotations=READ_ONLY, timeout=registry.settings.timeout)
+    @register_tool("gateway_firewall", timeout=registry.settings.timeout)
     async def nsx_get_realization_status(target: str, intent_path: str) -> Observation:
         """Read consolidated realization and enforcement-point status for a local intent path."""
         return await gateway.realization(target, identity(), intent_path)

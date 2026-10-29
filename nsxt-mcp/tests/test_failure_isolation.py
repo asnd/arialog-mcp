@@ -37,6 +37,7 @@ async def test_distinct_target_credentials(settings, caller, monkeypatch):
 async def test_file_secret_and_missing_secret(settings, caller, tmp_path, monkeypatch):
     secret = tmp_path / "password"
     secret.write_text("file-secret\n")
+    secret.chmod(0o600)
     settings.credential_profiles["service"] = CredentialProfile(
         username_env="TEST_NSX_USER", password_file=secret
     )

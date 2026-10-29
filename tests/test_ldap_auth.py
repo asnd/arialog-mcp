@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import base64
 import logging
 from typing import Any
@@ -11,6 +12,7 @@ from ldap3.core.exceptions import LDAPBindError, LDAPSocketOpenError
 
 from arialog_mcp.client import VRLIClient
 from arialog_mcp.ldap_auth import (
+    DirectoryUnavailableError,
     LDAPAuthenticator,
     UserAccessToken,
     _parse_basic,
@@ -53,6 +55,7 @@ class Directory:
                 f"uid={uid},{BASE}",
                 {
                     "uid": uid,
+                    "userPrincipalName": f"{uid}@example.org",
                     "userPassword": PASSWORDS[uid],
                     "objectClass": "inetOrgPerson",
                     "memberOf": groups,
@@ -142,6 +145,13 @@ async def test_empty_password_never_binds():
     assert d.binds == 0
 
 
+@pytest.mark.parametrize("username", ["alice,uid=bob", "alice+admin", "alice*", "alice\x00"])
+async def test_username_is_validated_before_ldap_bind(username):
+    directory = Directory()
+    assert await make_authn(directory).authenticate(username, "pw-alice") is None
+    assert directory.binds == 0
+
+
 async def test_failed_binds_are_throttled_per_username(clock: FakeClock):
     d = Directory()
     a = make_authn(d, clock)
@@ -156,6 +166,24 @@ async def test_failed_binds_are_throttled_per_username(clock: FakeClock):
     assert await a.authenticate("carol", "pw-carol") is not None
     clock.advance(301)
     assert await a.authenticate("alice", "pw-alice") == {"role": "ops"}
+
+
+async def test_concurrent_failed_binds_cannot_race_past_threshold():
+    d = Directory()
+    a = make_authn(d, max_failed_binds=3)
+    await asyncio.gather(*(a.authenticate("alice", f"wrong-{i}") for i in range(12)))
+    assert d.binds == 3
+
+
+async def test_global_bind_rate_limit_spans_usernames():
+    d = Directory()
+    a = make_authn(d, bind_burst=2, bind_requests_per_minute=1)
+    await asyncio.gather(
+        a.authenticate("unknown-one", "pw"),
+        a.authenticate("unknown-two", "pw"),
+        a.authenticate("unknown-three", "pw"),
+    )
+    assert d.binds == 2
 
 
 async def test_cached_login_survives_a_throttle(clock: FakeClock):
@@ -186,8 +214,9 @@ async def test_directory_down_denies_without_counting_failures(caplog):
     d = Directory(down=True)
     a = make_authn(d, max_failed_binds=1)
     with caplog.at_level(logging.ERROR, logger="arialog_mcp.ldap"):
-        assert await a.authenticate("alice", "pw-alice") is None
-        assert await a.authenticate("alice", "pw-alice") is None
+        for _ in range(2):
+            with pytest.raises(DirectoryUnavailableError):
+                await a.authenticate("alice", "pw-alice")
     assert d.binds == 2  # never throttled: an outage is not a bad password
     assert any(getattr(r, "event", "") == "ldap_unavailable" for r in caplog.records)
 
@@ -198,21 +227,27 @@ async def test_default_role_when_no_map_is_configured():
     assert await a.authenticate("bob", "pw-bob") == {"role": "ops"}
 
 
-async def test_search_filter_is_escaped():
-    seen: dict[str, str] = {}
+async def test_directory_search_is_bound_to_the_authenticated_dn():
+    directory = Directory()
+    authn = make_authn(directory)
+    assert await authn.authenticate("alice", "pw-alice") == {"role": "ops"}
 
-    class FakeConn:
-        entries: list[Any] = []
 
-        def search(self, *, search_base: str, search_filter: str, attributes: list[str]) -> None:
-            seen["filter"] = search_filter
+async def test_upn_bind_search_uses_the_exact_authenticated_upn():
+    directory = Directory()
 
-        def unbind(self) -> None:
-            raise RuntimeError("ignored")
+    def connect_upn(bind_dn: str, password: str) -> Any:
+        # ldap3's mock strategy accepts a DN for bind; Active Directory also accepts a UPN.
+        if bind_dn == "alice@example.org":
+            bind_dn = f"uid=alice,{BASE}"
+        return directory.connect(bind_dn, password)
 
-    a = make_authn(Directory(), connector=lambda dn, pw: FakeConn())
-    assert await a.authenticate("x)(uid=*", "pw") is None  # bound, but no entry -> unmapped
-    assert "(uid=x\\29\\28uid=\\2a)" in seen["filter"]
+    authn = make_authn(
+        directory,
+        user_dn_template="{username}@example.org",
+        connector=connect_upn,
+    )
+    assert await authn.authenticate("alice", "pw-alice") == {"role": "ops"}
 
 
 def test_password_is_never_serialised():
@@ -273,7 +308,7 @@ async def multi_stub():
 def ldap_app(multi_stub: Stub, clock: FakeClock):
     made: list[VRLIClient] = []
 
-    def _make(**over: Any):
+    def _make(*, directory: Directory | None = None, **over: Any):
         settings = make_settings(**{**LDAP_SETTINGS, **over})
         client = VRLIClient(
             settings,
@@ -282,7 +317,7 @@ def ldap_app(multi_stub: Stub, clock: FakeClock):
             clock=clock,
         )
         made.append(client)
-        mcp = create_server(settings, client, authenticator=make_authn(Directory()))
+        mcp = create_server(settings, client, authenticator=make_authn(directory or Directory()))
         return mcp.http_app(stateless_http=True, json_response=True)
 
     return _make
@@ -307,6 +342,13 @@ async def test_ldap_mode_challenges_with_basic(ldap_app):
     for bad in (basic("alice", "nope"), basic("bob", "pw-bob"), {"authorization": "Bearer x"}):
         r = await post(app, SEARCH, bad)
         assert r.status_code == 401 and r.headers["www-authenticate"].startswith("Basic")
+
+
+async def test_directory_outage_is_service_unavailable(ldap_app):
+    app = ldap_app(directory=Directory(down=True))
+    response = await post(app, SEARCH, basic("alice", "pw-alice"))
+    assert response.status_code == 503
+    assert "www-authenticate" not in response.headers
 
 
 async def test_probes_stay_open_in_ldap_mode(ldap_app):
@@ -384,7 +426,8 @@ async def test_real_ldap3_path_recovers_after_an_outage(caplog):
     )
     with caplog.at_level(logging.ERROR, logger="arialog_mcp.ldap"):
         for _ in range(3):
-            assert await a.authenticate("alice", "pw-alice") is None
+            with pytest.raises(DirectoryUnavailableError):
+                await a.authenticate("alice", "pw-alice")
     errors = [r.error for r in caplog.records if getattr(r, "event", "") == "ldap_unavailable"]
     assert len(errors) == 3
     assert all("invalid server address" not in e for e in errors), errors
@@ -403,8 +446,9 @@ async def test_group_search_failure_is_an_operator_error_not_unmapped(caplog):
 
     a = make_authn(Directory(), connector=lambda dn, pw: BrokenSearch(), max_failed_binds=1)
     with caplog.at_level(logging.INFO, logger="arialog_mcp.ldap"):
-        assert await a.authenticate("alice", "pw-alice") is None
-        assert await a.authenticate("alice", "pw-alice") is None  # not throttled
+        for _ in range(2):
+            with pytest.raises(DirectoryUnavailableError):
+                await a.authenticate("alice", "pw-alice")
     events = [getattr(r, "event", "") for r in caplog.records]
     assert events == ["ldap_unavailable", "ldap_unavailable"]
     assert "group search failed" in caplog.records[0].error  # type: ignore[attr-defined]

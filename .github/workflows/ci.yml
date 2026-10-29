@@ -46,3 +46,23 @@ jobs:
         run: |
           podman build --format docker -f Containerfile.test -t localhost/arialog-mcp-test:ci .
           podman run --rm --network none --read-only --tmpfs /tmp localhost/arialog-mcp-test:ci
+
+  nsxt-test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          version: "0.10.9"
+      - name: Sync NSX package
+        run: uv sync --project nsxt-mcp --locked --python ${{ matrix.python }}
+      - name: Lint NSX package
+        run: uv run --project nsxt-mcp ruff check nsxt-mcp && uv run --project nsxt-mcp ruff format --check nsxt-mcp
+      - name: Type-check NSX package
+        run: uv run --project nsxt-mcp mypy nsxt-mcp/src/nsxt_mcp nsxt-mcp/examples/mcp_client.py
+      - name: Test NSX package
+        run: uv run --project nsxt-mcp pytest nsxt-mcp/tests -q --cov=nsxt_mcp --cov-report=term-missing --cov-fail-under=90
