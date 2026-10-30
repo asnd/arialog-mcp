@@ -41,10 +41,23 @@ def main() -> None:
     try:
         settings = Settings()  # type: ignore[call-arg]
     except ValidationError as exc:
-        missing = ", ".join(".".join(map(str, e["loc"])) for e in exc.errors())
-        print(f"arialog-mcp: invalid configuration ({missing}); see .env.example", file=sys.stderr)
+        # loc names the setting; model-level checks have no loc, so show their message.
+        # Never print e["input"]: it can hold the password.
+        problems = "; ".join(
+            ".".join(map(str, e["loc"])) or e["msg"].removeprefix("Value error, ")
+            for e in exc.errors()
+        )
+        print(f"arialog-mcp: invalid configuration ({problems}); see .env.example", file=sys.stderr)
         raise SystemExit(2) from None
     configure_logging(settings.log_level)
+    if settings.transport == "http":
+        log = logging.getLogger("arialog_mcp")
+        if settings.auth_mode == "none":
+            log.warning("HTTP transport is unauthenticated", extra={"event": "http_no_auth"})
+        else:
+            log.info("HTTP auth enabled", extra={"event": "http_auth", "mode": settings.auth_mode})
+        if settings.auth_mode == "ldap" and not settings.ldap_verify_tls:
+            log.warning("LDAP TLS verification is disabled", extra={"event": "ldap_no_tls"})
     mcp = create_server(settings)
     if settings.transport == "http":
         mcp.run(transport="http", host=settings.http_host, port=settings.http_port)

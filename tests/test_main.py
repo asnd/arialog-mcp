@@ -65,7 +65,7 @@ def test_main_missing_config_exits_2_without_leaking(monkeypatch, capsys):
         entry.main()
     assert ei.value.code == 2
     err = capsys.readouterr().err
-    assert "host" in err and "username" in err and ".env.example" in err
+    assert "host" in err and ".env.example" in err
     assert "s3cret-pw" not in err
 
 
@@ -86,6 +86,8 @@ class FakeServer:
                 "ARIALOG_TRANSPORT": "http",
                 "ARIALOG_HTTP_HOST": "0.0.0.0",
                 "ARIALOG_HTTP_PORT": "9000",
+                "ARIALOG_HTTP_AUTH_TOKEN": "t" * 32,
+                "ARIALOG_HTTP_BEHIND_TLS_PROXY": "true",
             },
             ((), {"transport": "http", "host": "0.0.0.0", "port": 9000}),
         ),
@@ -101,3 +103,28 @@ def test_main_selects_transport(monkeypatch, restore_logging, extra, expected):
     assert fake.calls == [expected]
     assert seen["s"].password.get_secret_value() == "s3cret-pw"
     assert "s3cret-pw" not in repr(seen["s"])  # SecretStr never prints
+
+
+def test_main_reports_model_level_config_error(monkeypatch, capsys):
+    for k, v in {
+        **ENV,
+        "ARIALOG_TRANSPORT": "http",
+        "ARIALOG_HTTP_HOST": "0.0.0.0",
+        "ARIALOG_HTTP_BEHIND_TLS_PROXY": "true",
+    }.items():
+        monkeypatch.setenv(k, v)
+    with pytest.raises(SystemExit) as ei:
+        entry.main()
+    assert ei.value.code == 2
+    err = capsys.readouterr().err
+    assert "token or ldap is required" in err and "s3cret-pw" not in err
+
+
+def test_main_warns_when_http_is_unauthenticated(monkeypatch, restore_logging, caplog):
+    for k, v in {**ENV, "ARIALOG_TRANSPORT": "http"}.items():  # loopback: allowed
+        monkeypatch.setenv(k, v)
+    monkeypatch.setattr(entry, "create_server", lambda s: FakeServer())
+    monkeypatch.setattr(entry, "configure_logging", lambda level: None)
+    with caplog.at_level(logging.WARNING, logger="arialog_mcp"):
+        entry.main()
+    assert any(getattr(r, "event", None) == "http_no_auth" for r in caplog.records)

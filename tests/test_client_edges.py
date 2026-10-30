@@ -35,6 +35,17 @@ def with_login(get: Callable[[httpx.Request], httpx.Response]) -> Handler:
     return handler
 
 
+async def test_upstream_response_is_bounded_before_json_parsing(clock: FakeClock):
+    client = build(
+        clock,
+        lambda req: httpx.Response(200, content=b"x" * 1001),
+        max_response_bytes=1000,
+    )
+    with pytest.raises(UnavailableError, match="byte limit"):
+        await client.version()
+    await client.aclose()
+
+
 @pytest.mark.parametrize(
     "login,exc,match",
     [
@@ -189,7 +200,7 @@ async def test_request_carries_bearer_and_constraint_path_is_not_double_encoded(
 
 
 async def test_event_fields_given_as_text_offsets(clock):
-    text = "\U0001F600 esx-02 vmkernel: x"  # emoji = 2 UTF-16 code units, as in Java
+    text = "\U0001f600 esx-02 vmkernel: x"  # emoji = 2 UTF-16 code units, as in Java
     body = {
         "events": [
             {

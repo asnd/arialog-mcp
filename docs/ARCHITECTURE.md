@@ -1,113 +1,154 @@
-# arialog-mcp-analysis — Architecture & Plan
+# arialog-mcp — Architecture & Status
 
-Status: design notes (planning document; only the arialog-mcp server is implemented in this repo).
+Status: **The read-only Aria Operations for Logs MCP server is implemented.**
+`log-analyst` remains a future project. Published API shapes have not yet been
+verified against a production VRLI 8.18 appliance.
 
-## 1. Goal
-Analyse VMware Aria Operations for Logs (VRLI 8.18.x) logs on a remote appliance, driven by
-user input (text or file) now, and by alarms (polling/webhook) later. Output a structured
-root-cause report to a file and an MS Teams webhook.
+## 1. Goal and boundary
 
-## 2. Decisions (agreed)
-| Topic | Decision |
+`arialog-mcp` exposes bounded, reduced, read-only VRLI data to MCP-compatible
+clients. The current server supports stdio and Streamable HTTP transports and
+connects to VRLI 8.18.x using its `/api/v2` API. The HTTP service does not terminate
+TLS; put it behind a trusted TLS reverse proxy on remote networks.
+
+This repository contains the MCP server, stubs, tests and container files. The
+incident-analysis service described below is planning context and is not included
+in this repository. A separate NSX MCP server lives in [`../nsxt-mcp/`](../nsxt-mcp/README.md);
+it is an independent package and is not part of the Aria service runtime.
+
+## 2. Current architecture
+
+```text
+MCP host
+  ├── stdio (local)
+  └── Streamable HTTP (/mcp; localhost by default)
+          │ optional bearer auth or LDAP Basic auth
+          ▼
+     FastMCP server
+          │ async httpx, API client, bounded reduction
+          ▼
+     VRLI 8.18.x — HTTPS :9543 /api/v2
+```
+
+The HTTP auth modes are `none`, `token`, and `ldap`:
+
+| Mode | MCP caller authentication | VRLI execution identity | Constraints |
+|---|---|---|---|
+| `none` | None | Configured service account | Loopback only; remote mode requires TLS-proxy acknowledgement and explicit unauthenticated access |
+| `token` | Shared bearer token | Configured service account | Token is at least 16 characters; compare in constant time; remote TLS proxy required |
+| `ldap` | HTTP Basic checked through LDAPS as the caller | The same caller, per-user passthrough | No service-account fallback; verified LDAPS and remote TLS proxy required |
+
+Any non-loopback HTTP bind requires `ARIALOG_HTTP_BEHIND_TLS_PROXY=true`; this
+acknowledges the deployment boundary but does not itself configure TLS.
+
+Setting `ARIALOG_HTTP_AUTH_TOKEN` while `ARIALOG_HTTP_AUTH_MODE=none` retains the
+pre-LDAP behavior and enables token mode. Health endpoints remain unauthenticated;
+they never call VRLI. `/healthz` is liveness and `/readyz` reports readiness based
+on the circuit breaker.
+
+## 3. MCP tools and safety
+
+| Tool | VRLI endpoint / behavior |
 |---|---|
-| VRLI MCP | Build own `arialog-mcp` (read-only). Community servers (apollion69/vmware-aria-logs, zw008/VMware-Log-Insight) are reference only |
-| Agent | Standalone Podman microservice `log-analyst`, modelled on `ai-enrichment-gw` (copy & adapt, no cross-repo coupling) |
-| LLM | LiteLLM gateway, default model `gpt-oss-120b`, other models selectable via config |
-| Agent style | Hybrid: deterministic YAML playbook first, then LLM may request <= 3 extra MCP tool calls |
-| VRLI | 8.18.x, direct HTTPS :9543, `/api/v2`, AD auth (provider `ActiveDirectory`) |
-| Intake (v1) | Free text or file; pluggable adapters for later alarm polling / webhook |
-| Output (v1) | JSON/Markdown file (+ JSONL) and MS Teams incoming webhook |
-| Fixtures | Deferred; start with synthetic stub data |
+| `version` | Read version and reachability probe |
+| `log_aggregate` | Aggregate events by time bin; supports grouping and spike detection |
+| `log_signatures` | Group and mask message signatures before returning samples |
+| `log_search` | Bounded event search; returns completion/truncation metadata |
 
-## 3. Components
+Tools are read-only by construction. VRLI session login is the only non-GET
+operation. Event and byte caps, timeout checks, validation, circuit breaking,
+retry/backoff and per-user login protection bound the work. Results include query
+constraints and notes so incomplete results are not mistaken for exhaustive data.
+Upstream response bodies, event fields, and per-caller request rates are bounded;
+search/signature outputs redact common credential material before returning it.
+
+## 4. Authentication and identity
+
+### Service-account modes
+
+With `none` or `token`, the server uses the configured VRLI account (`username`,
+`password`, `provider`). Use an account with read-only VRLI access. The bearer token
+protects the MCP endpoint; it does not alter the VRLI execution identity.
+
+### LDAP caller passthrough
+
+LDAP usernames are restricted to a DN-safe character set, group lookup is tied to
+the authenticated DN/UPN rather than a broad attribute search, and bind attempts
+have per-user lockout and process-wide rate limits. Directory outages return
+service-unavailable responses rather than being presented as bad credentials.
+
+With `ARIALOG_HTTP_AUTH_MODE=ldap`:
+
+1. The MCP client sends HTTP Basic username/password over the TLS-protected
+   connection to the reverse proxy.
+2. The MCP server binds to the configured LDAPS endpoint as that user and reads
+   direct `memberOf` group values.
+3. `ARIALOG_LDAP_GROUP_ROLE_MAP` grants access to users in any mapped group. If no
+   group map is configured, an explicit `ARIALOG_DEFAULT_ROLE` is required and is
+   granted to every user who can bind.
+4. Each VRLI operation authenticates using the same user's credentials, with the
+   configured VRLI provider and optional username template. VRLI enforces that
+   user's own permissions.
+
+The server has bounded successful-bind caching, a failed-bind lockout guard,
+bounded per-user VRLI sessions, and rejected-login cooldowns. It does not fall back
+to the service account when a per-user VRLI login fails. Group roles are audit
+metadata; VRLI remains the authority for data permissions.
+
+Authentication values and formats intentionally match the `ariaops-mcp`
+`ARIAOPS_HTTP_AUTH_MODE=ldap` convention, using the `ARIALOG_` prefix.
+
+## 5. Configuration and secrets
+
+All settings use the `ARIALOG_` prefix; see `.env.example` and
+`src/arialog_mcp/config.py`. Invalid configuration exits with code 2 and identifies
+the setting without printing its value.
+
+For service-account or token mode, a private `.env` file is supported. For LDAP
+mode, directory credentials are caller-supplied and a VRLI service account is not
+used. Keep CA files, reverse-proxy TLS keys and env files outside version control.
+The application itself does not terminate TLS; the TLS proxy is a security
+boundary, especially because LDAP clients send their directory password to it on
+every request.
+
+## 6. Planned log-analyst integration
+
+The following architecture is a future goal, not implemented in this repository:
+
+```text
+text/file (later alarm adapters) → log-analyst → playbooks → arialog-mcp → VRLI
+                                                    ↓
+                                      reduce/redact → LLM → report/file/Teams
 ```
- text/file ─▶ ┌────────────────────────── log-analyst (:8080) ─────────────────────────┐
- (later:      │ Intake → Incident → Playbook → Gather(MCP) → Reduce+Redact → LLM → Report │─▶ file, Teams
-  poll/hook)  └───────────┬───────────────────────────────────────────────┬────────────┘
-                          │ MCP streamable HTTP                           │ OpenAI-compatible
-                          ▼                                               ▼
-                 arialog-mcp (read-only)                          LiteLLM (gpt-oss-120b)
-                          │ HTTPS :9543 /api/v2
-                          ▼
-                    VRLI 8.18.x            (optional later: ariaops-mcp for alert/metric context)
+
+The proposal is a standalone Podman service with deterministic YAML playbooks,
+bounded read-only MCP gathering, reduction/redaction before the LLM, structured RCA
+reports and file/Teams output. A limited allow-listed tool loop and future alarm
+intake remain planned. See the workspace architecture document if this repo is used
+as part of a larger operations workspace.
+
+## 7. Testing and validation
+
+- Unit tests use synthetic/stubbed VRLI responses and cover failure paths including
+  401/login cooldown, 429/5xx, timeouts, empty/partial responses and output caps.
+- `scripts/test-podman.sh` runs hermetic checks in a container without network access.
+- `scripts/e2e.sh` runs a VRLI stub and the MCP server. It also starts throwaway
+  OpenLDAP over LDAPS with a generated CA to check LDAP authentication and per-user
+  VRLI passthrough.
+- CI runs Ruff, formatting checks, mypy, pytest on Python 3.11–3.13, and builds the
+  container image. The independent NSX package has its own Python 3.11–3.13 CI
+  job and a 90% measured line-coverage floor.
+
+Run locally:
+
+```sh
+uv sync --locked
+uv run ruff check .
+uv run ruff format --check .
+uv run mypy
+NO_PROXY=127.0.0.1,localhost uv run pytest
+scripts/e2e.sh
 ```
 
-### 3.1 arialog-mcp (new, read-only)
-Style per `ariaops-mcp` (async httpx client, pydantic-settings, typed tool schemas, circuit
-breaker, domain exceptions, stdio + streamable HTTP). API client logic adapted from
-`vmware-ai-ops-agent/collectors/vrli.py` (note: that one uses `/api/v1`; this uses `/api/v2`).
-
-Tools:
-- `log_aggregate` — `aggregated-events`, counts per time bin, optional group-by field, spike flag
-- `log_signatures` — top message signatures (mask numbers/IDs/UUIDs/IPs, hash, count, first/last seen, 1-2 samples)
-- `log_search` — `events`, hard caps on rows and bytes, returns `complete` flag
-- `log_fields` — available fields for filtering
-- `alert_list` / `alert_get` — alert definitions/history if exposed by 8.18 API
-- `version`
-
-Rules: every response carries the exact query + time window; timestamp constraint is always
-set (VRLI defaults to last 1 minute); operator/value space encoded `%20`; session re-login on
-401; retry/backoff on 503 (appliance startup); concurrency limit to protect the appliance;
-all tools read-only (no write tools exist).
-
-### 3.2 log-analyst (new microservice)
-Modules adapted from `ai-enrichment-gw`: config (single YAML + `${ENV}`), http, llm client
-(+cache, token metrics), sinks, obs, middleware (API key). New: `intake/`, `playbooks/`,
-`gather` (MCP client), `reduce`, `analyse`, `report`, `teams` sink.
-
-Flow:
-1. **Intake** → `Incident{id, source, raw_text, entity?, window, keywords, severity?}`.
-   Free text: the LLM extracts entity/time/keywords into a pydantic schema; if time is missing, use a configured default window (assumption flagged in the report) rather than guessing silently.
-2. **Playbook select** — keyword/category rules in YAML (storage/APD, network, HA/vMotion, auth, generic).
-3. **Gather** — run playbook steps via MCP: aggregate → signatures → samples → neighbours.
-4. **Reduce + redact** — enforce token budget; mask IPs/usernames/secrets *before* prompt (defence in depth even if model is on-prem).
-5. **Analyse** — LLM call with evidence; may request <= 3 extra tool calls from an allow-list (read-only MCP tools). If the model does not support/ignores tool calls, degrade to playbook-only.
-6. **Report** — pydantic `RcaReport{summary, hypotheses[{text, confidence, evidence_refs}], affected_entities, queries_run, next_steps, assumptions, limitations}`; one repair retry on invalid JSON, then emit a degraded report with raw evidence.
-7. **Sinks** — file (+JSONL) and Teams webhook (Adaptive Card / MessageCard, retries, size-trimmed, link to full file).
-
-API: `POST /v1/analyse` (text or file upload), `GET /v1/reports/{id}`, `/healthz`, `/metrics`; CLI `la analyse --text/--file`, `la validate`.
-
-## 4. Repo layout
-```
-arialog-mcp-analysis/
-  ARCHITECTURE.md
-  arialog-mcp/    src/arialog_mcp/{client,reduce,server,config}.py tools/ tests/ Containerfile
-  log-analyst/    src/log_analyst/{intake,playbooks,gather,reduce,analyse,report,sinks,api,cli,config}.py tests/ Containerfile
-  deploy/         compose.yaml  (arialog-mcp, log-analyst, vrli-stub, llm-stub)
-  tests/stubs/    vrli_stub/ (FastAPI replaying JSON), llm_stub/ (OpenAI-compatible), fixtures/
-```
-
-## 5. Security
-- Read-only AD service account for VRLI; secrets via env/`chmod 600` config, never logged.
-- TLS verification on by default (configurable CA bundle).
-- `log-analyst` API protected by API key; MCP server not exposed outside the compose network.
-- Teams webhook URL is a secret. Reports may contain log excerpts: redaction applies to reports too.
-- Audit log: every MCP call + LLM call (model, tokens, latency), no raw secrets.
-
-## 6. Testing (Podman compose, hermetic)
-Unit tests (respx) + compose e2e with `vrli-stub` and `llm-stub`. Failure paths: 503 on
-startup, expired session (401), timeout/partial result (`complete=false`), empty results,
-huge result (cap), malformed LLM JSON, LLM ignoring tool calls, gateway 429/5xx, Teams
-webhook failure (report still written). Gates: `ruff check`, `mypy`, `pytest`, `py_compile`.
-
-## 7. Phases
-1. **arialog-mcp + vrli-stub** — ✅ DONE 2026-10-07: client, auth, 4 core tools (`version`, `log_aggregate`, `log_signatures`, `log_search`), 44 unit tests (90% coverage), Podman e2e (`scripts/e2e.sh`).
-2. **log-analyst v1**: text/file intake, playbooks, gather, reduce/redact, single LLM call, file + Teams sinks, compose e2e.
-3. **Hybrid tool loop**: allow-listed extra MCP calls, budget limits, fallback.
-4. **Alarm intake**: VRLI alert polling and/or webhook endpoint; dedupe/debounce; optional ariaops-mcp enrichment.
-5. **Hardening**: real-data fixtures (anonymised), tuning playbooks, evaluation set.
-
-## 8. Resolved / open
-Resolved (2026-10-07):
-1. Models are hosted on-prem (vLLM provider behind a LiteLLM gateway); pin `gpt-oss-120b`, allow other on-prem models via config.
-2. Tool calls and JSON output are supported on the gateway route.
-3. Teams: Workflows webhook (Adaptive Card payload).
-4. AD service account: placeholder credentials in config/compose for now.
-5. Default time window for free-text incidents: configurable (`intake.default_window_minutes`, default 60).
-6. Single VRLI instance for now (config still uses a named target).
-
-7. MCP framework: **FastMCP, exact version pinned**, for both `arialog-mcp` (server) and `log-analyst` (client). `client.py`/`reduce.py` stay free of MCP imports so the framework can be swapped. A small spike (hello-tool, stdio + HTTP, in-memory test, under Podman) runs before phase 1 to confirm the pinned versions.
-
-Open:
-- Verify 8.18 API surface (`aggregated-events`, alert endpoints, any grouping endpoint) against a real appliance; signature grouping stays client-side until confirmed.
-- Phase 1 limits: `log_fields`, `alert_list/get` and group-by aggregation are not built yet (need real-appliance response shapes). HTTP transport has no auth yet (phase 5). Run `scripts/e2e.sh` for the hermetic Podman test; unit tests: `NO_PROXY=127.0.0.1,localhost uv run pytest`.
+The tests validate the synthetic contract; payloads and permissions still require
+verification against a real VRLI 8.18 deployment.

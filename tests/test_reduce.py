@@ -3,6 +3,7 @@ from arialog_mcp.reduce import (
     cap_events,
     group_signatures,
     mask,
+    sanitize_event,
     time_bins,
     zscores,
 )
@@ -71,3 +72,24 @@ def test_time_bins_follows_vrli_phase_and_keeps_unexpected_bins():
     assert [b.start_ms for b in tb] == [1_500, 3_500, 99_000]
     assert [b.partial for b in tb] == [False, False, True]
     assert time_bins([], start_ms=0, end_ms=4_000, width_ms=2_000)[1].count == 0.0
+
+
+def test_sensitive_credentials_are_redacted_from_event_text_and_fields():
+    event = sanitize_event(
+        RawEvent(
+            1,
+            'password="topsecret" Authorization: Bearer abc123 https://u:p@host',
+            {"api_token": "private", "hostname": "node-a"},
+        )
+    )
+    assert "topsecret" not in event.text
+    assert "abc123" not in event.text
+    assert "u:p" not in event.text
+    assert event.fields == {"api_token": "[redacted]", "hostname": "node-a"}
+
+
+def test_byte_budget_counts_event_fields():
+    events = [RawEvent(1, "short", {"description": "x" * 1000})]
+    kept, reason = cap_events(events, limit=10, max_bytes=200, max_text_chars=1000)
+    assert kept == []
+    assert reason == "byte budget of 200 reached"

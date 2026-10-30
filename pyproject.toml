@@ -10,8 +10,9 @@ readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "MIT" }
 dependencies = [
-    "fastmcp==4.0.11",
+    "fastmcp==4.1.3",
     "httpx>=0.27",
+    "ldap3==2.9.1",
     "pydantic>=2.6",
     "pydantic-settings>=2.2",
 ]
@@ -35,7 +36,7 @@ packages = ["src/arialog_mcp"]
 asyncio_mode = "auto"
 testpaths = ["tests"]
 pythonpath = ["src", "tests/stubs"]
-filterwarnings = ["ignore::DeprecationWarning:fastmcp.*"]
+filterwarnings = ["ignore::DeprecationWarning:fastmcp.*", "ignore::DeprecationWarning:ldap3.*"]
 
 [tool.ruff]
 line-length = 100

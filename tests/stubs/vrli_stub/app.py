@@ -13,6 +13,8 @@ Mimics the documented behaviour that matters to clients (Log Insight query API d
 * /api/v2/version requires a session.
 Where the docs are silent, the stub takes the least convenient reading: aggregated bins are
 epoch-aligned, sparse (empty bins omitted) and returned newest first.
+* bearer sessions with a TTL, one per user (STUB_USERS={"user": "pass", ...} adds users
+  next to STUB_USER/STUB_PASS; /_stub/stats counts requests per VRLI user).
 
 Fault injection (POST /_stub/faults, DELETE to reset) lets tests exercise failure paths.
 The payload shapes follow the public API docs; they are NOT verified against a real 8.18
@@ -22,6 +24,7 @@ appliance — see ARCHITECTURE.md open items.
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import re
 import secrets
@@ -170,13 +173,15 @@ def create_app(
     now_fn: Callable[[], int] | None = None,
     username: str | None = None,
     password: str | None = None,
+    users: dict[str, str] | None = None,
 ) -> Starlette:
     anchor = anchor_ms if anchor_ms is not None else int(time.time() * 1000)
     now = now_fn or (lambda: anchor)
     user = username or os.environ.get("STUB_USER", "svc-test")
     pwd = password or os.environ.get("STUB_PASS", "placeholder")
+    accounts = {user: pwd, **json.loads(os.environ.get("STUB_USERS", "{}")), **(users or {})}
     dataset = make_dataset(anchor)
-    sessions: dict[str, float] = {}
+    sessions: dict[str, tuple[float, str]] = {}
     state: dict[str, Any] = {}
 
     def reset() -> None:
@@ -192,6 +197,8 @@ def create_app(
             ttl=1800,
             regex_enabled=False,
             last_query={},
+            requests_by_user={},
+            logins_by_user={},
         )
 
     reset()
@@ -241,18 +248,22 @@ def create_app(
             raise ValueError(f"limit must be 1-{maximum}")
         return limit
 
-    async def gate(request: Request) -> Response | None:
+    async def gate(request: Request, *, auth: bool = True) -> Response | None:
         state["request_count"] += 1
         if state["latency_s"]:
             await asyncio.sleep(state["latency_s"])
         if state["unavailable_next"] > 0:
             state["unavailable_next"] -= 1
             return JSONResponse({"errorMessage": "Service starting"}, status_code=503)
-        token = request.headers.get("authorization", "").removeprefix("Bearer ").strip()
-        if token not in sessions:
-            return PlainTextResponse("Invalid session ID", status_code=401)
-        if sessions[token] < time.monotonic():
-            return PlainTextResponse("Login Timeout", status_code=440)
+        if auth:
+            token = request.headers.get("authorization", "").removeprefix("Bearer ").strip()
+            expiry, who = sessions.get(token, (0.0, ""))
+            if token not in sessions:
+                return PlainTextResponse("Invalid session ID", status_code=401)
+            if expiry < time.monotonic():
+                return PlainTextResponse("Login Timeout", status_code=440)
+            by_user = state["requests_by_user"]
+            by_user[who] = by_user.get(who, 0) + 1
         return None
 
     async def login(request: Request) -> Response:
@@ -261,9 +272,10 @@ def create_app(
             return JSONResponse({"errorMessage": "Service starting"}, status_code=503)
         body = await request.json()
         state["login_count"] += 1
+        who = str(body.get("username"))
         if (
-            body.get("username") != user
-            or body.get("password") != pwd
+            who not in accounts
+            or body.get("password") != accounts[who]
             or body.get("provider") not in ("Local", "ActiveDirectory", "vIDM")
         ):
             state["login_failures"] += 1
@@ -274,8 +286,9 @@ def create_app(
                 },
                 status_code=401,
             )
+        state["logins_by_user"][who] = state["logins_by_user"].get(who, 0) + 1
         token = secrets.token_hex(16)
-        sessions[token] = time.monotonic() + state["ttl"]
+        sessions[token] = (time.monotonic() + state["ttl"], who)
         return JSONResponse({"userId": "u-1", "sessionId": token, "ttl": state["ttl"]})
 
     def body_or_bad_json(payload: dict[str, Any]) -> Response:
@@ -338,14 +351,24 @@ def create_app(
             if body.pop("expire_sessions", False):  # appliance forgot them -> 401
                 sessions.clear()
             if body.pop("timeout_sessions", False):  # sessions timed out -> 440
-                for token in sessions:
-                    sessions[token] = 0.0
+                for token, (_, who) in sessions.items():
+                    sessions[token] = (0.0, who)
             state.update(body)
         return JSONResponse({k: v for k, v in state.items()})
 
     async def stats(_: Request) -> Response:
         return JSONResponse(
-            {k: state[k] for k in ("login_count", "login_failures", "request_count", "last_query")}
+            {
+                k: state[k]
+                for k in (
+                    "login_count",
+                    "login_failures",
+                    "request_count",
+                    "last_query",
+                    "requests_by_user",
+                    "logins_by_user",
+                )
+            }
             | {"anchor_ms": anchor}
         )
 

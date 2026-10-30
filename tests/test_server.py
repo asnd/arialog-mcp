@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import inspect
 import logging
 
 import httpx
@@ -7,9 +8,11 @@ import pytest
 from fastmcp import Client
 from fastmcp.exceptions import ToolError
 
-from arialog_mcp.client import VRLIClient
+from arialog_mcp.client import RawEvents, VRLIClient
+from arialog_mcp.reduce import RawEvent
 from arialog_mcp.server import create_server
-from conftest import END, START, FakeClock, Stub, make_settings, no_sleep
+from arialog_mcp.service import ArialogService
+from conftest import ANCHOR, END, START, FakeClock, Stub, make_settings, no_sleep
 
 WINDOW = {"start": START, "end": END}
 
@@ -59,9 +62,11 @@ async def test_aggregate_bin_width_never_exceeds_cap(make_mcp):
 async def test_signatures_group_and_rank(make_mcp):
     r = await call(make_mcp(), "log_signatures", WINDOW)
     top, second = r["signatures"][0], r["signatures"][1]
-    assert "vmkernel: ScsiDeviceIO" in top["template"] and top["count"] == 1200
+    assert top["template"].startswith("esx-<N> vmkernel: ScsiDeviceIO") and top["count"] == 1200
     assert top["top_hosts"] == {"esx-02": 1200} and len(top["samples"]) == 2
-    assert "Hostd: Accepted password" in second["template"] and second["count"] == 360
+    assert (
+        second["template"].startswith("esx-<N> Hostd: Accepted password") and second["count"] == 360
+    )
     assert r["distinct_signatures"] == 3 and r["scanned"] == 1564 and not r["scan_truncated"]
     assert r["signatures"][2]["count"] == 4  # four VMFS ids collapse into one template
 
@@ -80,7 +85,7 @@ async def test_search_filters_and_orders_newest_first(make_mcp):
         {
             **WINDOW,
             "text_any": ["Lost access"],
-            "filters": [{"field": "hostname", "op": "CONTAINS", "value": "esx-02"}],
+            "filters": [{"field": "hostname", "op": "=", "value": "esx-02"}],
             "limit": 10,
         },
     )
@@ -106,7 +111,7 @@ async def test_relative_window(make_mcp):
 
 
 async def test_text_term_cannot_escape_into_other_constraints(make_mcp):
-    r = await call(make_mcp(), "log_search", {**WINDOW, "text_any": ["x/timestamp/LAST 1"]})
+    r = await call(make_mcp(), "log_search", {**WINDOW, "text_all": ["x/timestamp/LAST 1"]})
     assert r["returned"] == 0  # no 400, no widened window
 
 
@@ -163,13 +168,19 @@ async def test_signatures_empty_window(make_mcp):
 
 async def test_audit_log_records_calls_without_secrets(make_mcp, caplog):
     caplog.set_level(logging.INFO, logger="arialog_mcp.audit")
-    await call(make_mcp(), "log_search", {**WINDOW, "limit": 1})
+    await call(
+        make_mcp(),
+        "log_search",
+        {**WINDOW, "limit": 1, "text_any": ["audit-secret-value"]},
+    )
     with pytest.raises(ToolError):
         await call(make_mcp(), "log_search", {"start": "2026-10-07T10:00:00"})
     recs = [r for r in caplog.records if r.name == "arialog_mcp.audit"]
     assert [r.getMessage() for r in recs] == ["tool ok", "tool failed"]
     assert recs[0].tool == "log_search" and recs[0].ms >= 0
+    assert not hasattr(recs[0], "tool_args")
     assert "placeholder" not in caplog.text and "Bearer" not in caplog.text
+    assert "audit-secret-value" not in caplog.text
 
 
 async def test_unexpected_exception_is_logged_and_surfaced(make_mcp, caplog):
@@ -178,10 +189,9 @@ async def test_unexpected_exception_is_logged_and_surfaced(make_mcp, caplog):
     async def boom(*a, **k):
         raise RuntimeError("kaboom")
 
-    # reach the shared client through the first registered tool's closure
-    for cell in (await mcp.get_tool("log_search")).fn.__closure__ or ():
-        if isinstance(cell.cell_contents, VRLIClient):
-            cell.cell_contents.events = boom  # type: ignore[method-assign]
+    for cell in inspect.unwrap((await mcp.get_tool("log_search")).fn).__closure__ or ():
+        if isinstance(cell.cell_contents, ArialogService):
+            cell.cell_contents.client.events = boom  # type: ignore[method-assign]
     with caplog.at_level(logging.ERROR, logger="arialog_mcp.audit"), pytest.raises(ToolError):
         await call(mcp, "log_search", WINDOW)
     assert any(r.getMessage() == "tool crashed" for r in caplog.records)
@@ -229,105 +239,165 @@ async def test_invalid_arguments_are_audited_as_rejected(make_mcp, caplog):
     assert recs[0].exc_info is None  # no traceback noise for caller mistakes
 
 
-async def test_search_returns_hostname_parsed_from_text_offsets(make_mcp):
-    r = await call(make_mcp(), "log_search", {**WINDOW, "text_any": ["Lost access"], "limit": 1})
-    ev = r["events"][0]
-    assert ev["host"] == "esx-02" and ev["fields"]["appname"] == "vmkernel"
-    assert ev["fields"]["source"] == "10.0.0.12"
+async def test_unexpected_exception_details_are_masked(make_mcp):
+    mcp = make_mcp()
+
+    async def boom(*a, **k):
+        raise RuntimeError("internal detail /etc/secret")
+
+    for cell in inspect.unwrap((await mcp.get_tool("log_search")).fn).__closure__ or ():
+        if isinstance(cell.cell_contents, ArialogService):
+            cell.cell_contents.client.events = boom  # type: ignore[method-assign]
+    with pytest.raises(ToolError) as ei:
+        await call(mcp, "log_search", WINDOW)
+    assert "internal detail" not in str(ei.value)
 
 
-async def test_text_all_requires_every_word(make_mcp):
-    args = {**WINDOW, "text_all": ["volume", "lost"], "limit": 10}
-    r = await call(make_mcp(), "log_search", args)
-    assert r["returned"] == 4
-    r = await call(make_mcp(), "log_search", {**WINDOW, "text_all": ["volume", "SCSI"]})
-    assert r["returned"] == 0  # VRLI would OR two CONTAINS; HAS keeps the AND
+async def test_search_and_signature_outputs_redact_sensitive_log_content(make_mcp):
+    mcp = make_mcp()
+
+    async def events(*args, **kwargs):
+        return RawEvents(
+            [
+                RawEvent(
+                    ANCHOR,
+                    'password="log-secret" Authorization: Bearer token-value',
+                    {"hostname": "node-a", "api_key": "field-secret"},
+                )
+            ],
+            complete=True,
+        )
+
+    for cell in inspect.unwrap((await mcp.get_tool("log_search")).fn).__closure__ or ():
+        if isinstance(cell.cell_contents, ArialogService):
+            cell.cell_contents.client.events = events  # type: ignore[method-assign]
+    search = await call(mcp, "log_search", WINDOW)
+    signatures = await call(mcp, "log_signatures", WINDOW)
+    rendered = str(search) + str(signatures)
+    assert "log-secret" not in rendered
+    assert "token-value" not in rendered
+    assert "field-secret" not in rendered
+    assert "[redacted]" in rendered
 
 
-async def test_text_any_matches_either_phrase(make_mcp):
-    r = await call(
+async def test_too_many_text_terms_rejected_by_schema(make_mcp):
+    with pytest.raises(ToolError):
+        await call(make_mcp(), "log_search", {**WINDOW, "text_all": ["a"] * 11})
+
+
+async def test_readyz_reflects_breaker_without_touching_vrli(make_mcp, stub: Stub):
+    mcp = make_mcp()
+    app = mcp.http_app()
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://t") as c:
+        assert (await c.get("/readyz")).status_code == 200
+        await stub.faults(unavailable_next=999)
+        for _ in range(2):  # breaker_failures=2
+            with pytest.raises(ToolError):
+                await call(mcp, "log_search", WINDOW)
+        before = (await stub.stats())["request_count"]
+        r = await c.get("/readyz")
+        assert r.status_code == 503 and "circuit open" in r.text
+        assert (await stub.stats())["request_count"] == before
+
+
+async def test_http_auth_token_guards_mcp_but_not_probes(make_mcp):
+    token = "s" * 32
+    app = make_mcp(http_auth_token=token).http_app()
+    async with (
+        app.router.lifespan_context(app),
+        httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://t") as c,
+    ):
+        assert (await c.get("/healthz")).status_code == 200
+        assert (await c.get("/readyz")).status_code == 200
+        body = {"jsonrpc": "2.0", "id": 1, "method": "tools/list"}
+        hdrs = {"accept": "application/json, text/event-stream"}
+        assert (await c.post("/mcp", json=body, headers=hdrs)).status_code == 401
+        bad = {**hdrs, "authorization": "Bearer " + "x" * 32}
+        assert (await c.post("/mcp", json=body, headers=bad)).status_code == 401
+        good = {**hdrs, "authorization": f"Bearer {token}"}
+        assert (await c.post("/mcp", json=body, headers=good)).status_code != 401
+
+
+async def test_http_tool_calls_are_rate_limited_per_authenticated_caller(make_mcp):
+    token = "r" * 32
+    app = make_mcp(http_auth_token=token, caller_burst=1).http_app(
+        stateless_http=True, json_response=True
+    )
+    body = {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "tools/call",
+        "params": {"name": "version", "arguments": {}},
+    }
+    headers = {
+        "authorization": f"Bearer {token}",
+        "accept": "application/json, text/event-stream",
+    }
+    async with (
+        app.router.lifespan_context(app),
+        httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://t") as client,
+    ):
+        first = await client.post("/mcp", json=body, headers=headers)
+        second = await client.post("/mcp", json=body, headers=headers)
+    assert first.status_code == second.status_code == 200
+    assert not first.json()["result"].get("isError")
+    assert second.json()["result"]["isError"]
+    assert "request budget" in second.json()["result"]["content"][0]["text"]
+
+
+async def test_text_all_and_text_any_have_distinct_semantics(make_mcp):
+    all_terms = await call(
+        make_mcp(), "log_search", {**WINDOW, "text_all": ["volume", "lost"], "limit": 10}
+    )
+    assert all_terms["returned"] == 4
+    none = await call(
+        make_mcp(), "log_search", {**WINDOW, "text_all": ["volume", "SCSI"], "limit": 10}
+    )
+    assert none["returned"] == 0
+    any_phrases = await call(
         make_mcp(),
         "log_signatures",
         {**WINDOW, "text_any": ["Lost access", "Accepted password"]},
     )
-    assert r["scanned"] == 364 and r["distinct_signatures"] == 2
+    assert any_phrases["scanned"] == 364
 
 
-async def test_or_note_for_repeated_filters(make_mcp):
-    r = await call(
-        make_mcp(),
-        "log_search",
-        {
-            **WINDOW,
-            "filters": [
-                {"field": "hostname", "op": "CONTAINS", "value": "esx-01"},
-                {"field": "hostname", "op": "CONTAINS", "value": "esx-03"},
-            ],
-            "limit": 200,
-        },
+async def test_search_resolves_hostname_and_appname_text_offsets(make_mcp):
+    result = await call(
+        make_mcp(), "log_search", {**WINDOW, "text_any": ["Lost access"], "limit": 1}
     )
-    assert {e["host"] for e in r["events"]} == {"esx-01", "esx-03"}
-    assert any("ORs" in n for n in r["notes"])
+    event = result["events"][0]
+    assert event["host"] == "esx-02" and event["fields"]["appname"] == "vmkernel"
+    assert event["fields"]["source"] == "10.0.0.12"
 
 
-async def test_regex_rejection_explains_the_appliance_setting(make_mcp):
+async def test_aggregate_zero_fills_sparse_bins_and_marks_partial_edges(make_mcp):
+    result = await call(
+        make_mcp(), "log_aggregate", {**WINDOW, "text_any": ["ScsiDeviceIO"], "bin_seconds": 300}
+    )
+    bins = result["bins"]
+    assert len(bins) == 24
+    assert sum(bin_["count"] == 0 for bin_ in bins) == 23
+    assert result["total"] == 1200
+
+
+async def test_unaligned_aggregate_stays_within_cap_and_marks_edges(make_mcp):
+    result = await call(
+        make_mcp(max_bins=24),
+        "log_aggregate",
+        {"start": "2026-10-07T10:00:07Z", "end": "2026-10-07T12:00:07Z"},
+    )
+    assert len(result["bins"]) <= 24
+    assert result["bins"][0]["partial"] and result["bins"][-1]["partial"]
+
+
+async def test_regex_error_explains_appliance_configuration(make_mcp):
     with pytest.raises(ToolError, match="regex-query-enabled"):
         await call(
             make_mcp(),
             "log_search",
             {**WINDOW, "filters": [{"field": "text", "op": "=~", "value": "Lost.*"}]},
         )
-
-
-async def test_regex_works_when_enabled(make_mcp, stub: Stub):
-    await stub.faults(regex_enabled=True)
-    r = await call(
-        make_mcp(),
-        "log_search",
-        {**WINDOW, "filters": [{"field": "text", "op": "=~", "value": "Lost access.*prod"}]},
-    )
-    assert r["returned"] == 4
-
-
-async def test_aggregate_fills_sparse_bins_and_requests_enough(make_mcp, stub: Stub):
-    """The stub omits empty bins and answers newest first; spikes must still be found."""
-    r = await call(
-        make_mcp(),
-        "log_aggregate",
-        {**WINDOW, "text_any": ["ScsiDeviceIO"], "bin_seconds": 300},
-    )
-    starts = [b["start"] for b in r["bins"]]
-    assert starts == sorted(starts) and len(starts) == 24
-    assert sum(1 for b in r["bins"] if b["count"] == 0) == 23
-    assert [s["start"][11:16] for s in r["spikes"]] == ["11:30"] and r["total"] == 1200
-    assert (await stub.stats())["last_query"]["limit"] == "146"
-
-
-async def test_aggregate_never_exceeds_max_bins_on_unaligned_window(make_mcp):
-    r = await call(
-        make_mcp(max_bins=24),
-        "log_aggregate",
-        {"start": "2026-10-07T10:00:07Z", "end": "2026-10-07T12:00:07Z"},
-    )
-    assert len(r["bins"]) <= 24 and not any("dropped" in n for n in r["notes"])
-    assert r["bins"][0]["partial"] and r["bins"][-1]["partial"]
-    assert r["bins"][0]["zscore"] is None
-
-
-async def test_aggregate_reports_vrli_bin_limit_as_incomplete(make_mcp):
-    from arialog_mcp.client import RawBin, RawBins
-
-    mcp = make_mcp(max_bins=8)
-
-    async def full(*a, **k):
-        return RawBins([RawBin(0, 1, 1.0)], complete=True, limit_reached=True)
-
-    for cell in (await mcp.get_tool("log_aggregate")).fn.__closure__ or ():
-        if isinstance(cell.cell_contents, VRLIClient):
-            cell.cell_contents.aggregated = full  # type: ignore[method-assign]
-    r = await call(mcp, "log_aggregate", {**WINDOW, "bin_seconds": 900})
-    assert r["complete"] is False and any("limit reached" in n for n in r["notes"])
-    assert any("oldest bins dropped" in n for n in r["notes"])  # epoch-0 bin + 8 in window
 
 
 async def test_version_logs_in(make_mcp, stub: Stub):

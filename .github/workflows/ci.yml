@@ -1,0 +1,68 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          version: "0.10.9"
+      - name: Sync
+        run: uv sync --frozen --python ${{ matrix.python }}
+      - name: Lint
+        run: uv run ruff check . && uv run ruff format --check .
+      - name: Types
+        run: uv run mypy
+      - name: Tests
+        env:
+          NO_PROXY: 127.0.0.1,localhost
+        run: uv run pytest -q --cov=arialog_mcp --cov-report=term-missing --cov-fail-under=90
+
+  image:
+    runs-on: ubuntu-latest
+    needs: test
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build runtime image
+        run: podman build --format docker -t localhost/arialog-mcp:ci .
+      - name: Build test image and run it hermetically
+        run: |
+          podman build --format docker -f Containerfile.test -t localhost/arialog-mcp-test:ci .
+          podman run --rm --network none --read-only --tmpfs /tmp localhost/arialog-mcp-test:ci
+
+  nsxt-test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          version: "0.10.9"
+      - name: Sync NSX package
+        run: uv sync --project nsxt-mcp --locked --python ${{ matrix.python }}
+      - name: Lint NSX package
+        run: uv run --project nsxt-mcp ruff check nsxt-mcp && uv run --project nsxt-mcp ruff format --check nsxt-mcp
+      - name: Type-check NSX package
+        run: uv run --project nsxt-mcp mypy nsxt-mcp/src/nsxt_mcp nsxt-mcp/examples/mcp_client.py
+      - name: Test NSX package
+        run: uv run --project nsxt-mcp pytest nsxt-mcp/tests -q --cov=nsxt_mcp --cov-report=term-missing --cov-fail-under=90

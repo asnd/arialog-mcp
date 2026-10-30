@@ -1,0 +1,36 @@
+services:
+  nsxt-mcp:
+    image: localhost/nsxt-mcp:0.1.0
+    build:
+      context: .
+      dockerfile: Containerfile
+    command:
+      - --config
+      - /config/config.json
+      - --transport
+      - http
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8443"
+      - --ssl-certfile
+      - /config/server.crt
+      - --ssl-keyfile
+      - /config/server.key
+    env_file: ${NSXT_ENV_FILE:-.env}
+    environment:
+      NSXT_HEALTH_URL: https://localhost:8443/healthz
+      NSXT_HEALTH_CA: /config/health-ca.crt
+    ports:
+      - "127.0.0.1:8443:8443"
+    volumes:
+      - "${NSXT_CONFIG_DIR:-./deploy/config}:/config:ro,z"
+    read_only: true
+    tmpfs:
+      - /tmp:rw,nosuid,noexec,size=64m
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    pids_limit: 256
+    restart: unless-stopped

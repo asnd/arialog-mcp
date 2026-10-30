@@ -1,12 +1,14 @@
 """End-to-end checks against a running arialog-mcp (HTTP) + vrli-stub. Run inside a container.
 
 usage: e2e_client.py <mcp_url> <stub_url> <badcreds_mcp_url>
+The MCP bearer token is read from ARIALOG_HTTP_AUTH_TOKEN.
 """
 
 from __future__ import annotations
 
 import asyncio
 import json
+import os
 import sys
 import urllib.request
 from datetime import UTC, datetime
@@ -15,6 +17,7 @@ from fastmcp import Client
 from fastmcp.exceptions import ToolError
 
 MCP, STUB, BAD = sys.argv[1:4]
+TOKEN = os.environ["ARIALOG_HTTP_AUTH_TOKEN"]
 OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
 
@@ -33,7 +36,7 @@ def ok(name: str) -> None:
 
 
 async def call(url: str, tool: str, args: dict):
-    async with Client(url) as c:
+    async with Client(url, auth=TOKEN) as c:
         return (await c.call_tool(tool, args)).structured_content
 
 
@@ -54,7 +57,7 @@ async def main() -> None:
     start = datetime.fromtimestamp((anchor - 125 * 60_000) / 1000, tz=UTC).isoformat()
     window = {"start": start, "end": end}
 
-    async with Client(MCP) as c:
+    async with Client(MCP, auth=TOKEN) as c:
         names = {t.name for t in await c.list_tools()}
     assert names == {"version", "log_aggregate", "log_signatures", "log_search"}, names
     ok("tools listed")

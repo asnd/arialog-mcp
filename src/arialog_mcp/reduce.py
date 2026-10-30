@@ -7,10 +7,12 @@ No MCP imports here.
 from __future__ import annotations
 
 import hashlib
+import json
 import re
 import statistics
 from collections import Counter
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 
 # Order matters: most specific first, bare numbers last.
 _MASKS: list[tuple[re.Pattern[str], str]] = [
@@ -27,6 +29,12 @@ _MASKS: list[tuple[re.Pattern[str], str]] = [
     (re.compile(r"\d+"), "<N>"),
 ]
 _WS = re.compile(r"\s+")
+_SECRET_ASSIGNMENT = re.compile(
+    r"""(?i)(["']?)(password|passwd|token|secret|api[_-]?key|private[_-]?key)\1"""
+    r"""(\s*[:=]\s*)(["']?)[^\s,;}"']+"""
+)
+_AUTH_HEADER = re.compile(r"(?i)\b(Bearer|Basic)(\s+)[A-Za-z0-9._~+/-]+=*")
+_URL_CREDENTIALS = re.compile(r"(?i)(://)[^/@\s:]+:[^/@\s]+@")
 MAX_TEMPLATE_CHARS = 300
 
 
@@ -35,6 +43,13 @@ def mask(text: str) -> str:
     for pattern, repl in _MASKS:
         text = pattern.sub(repl, text)
     return _WS.sub(" ", text).strip()[:MAX_TEMPLATE_CHARS]
+
+
+def redact_sensitive_text(text: str) -> str:
+    """Redact common credential assignments and authorization material in log content."""
+    text = _SECRET_ASSIGNMENT.sub(r"\1\2\1\3[redacted]", text)
+    text = _AUTH_HEADER.sub(r"\1\2[redacted]", text)
+    return _URL_CREDENTIALS.sub(r"\1[redacted]@", text)
 
 
 def signature_id(template: str) -> str:
@@ -65,6 +80,25 @@ class SignatureGroup:
 
 def truncate(text: str, limit: int) -> str:
     return text if len(text) <= limit else text[: limit - 1] + "…"
+
+
+def sanitize_event(ev: RawEvent, *, max_text_chars: int = 1000) -> RawEvent:
+    fields = {
+        name[:128]: (
+            "[redacted]"
+            if any(
+                secret in name.lower()
+                for secret in ("password", "passwd", "secret", "token", "key")
+            )
+            else truncate(redact_sensitive_text(value), max_text_chars)
+        )
+        for name, value in list(ev.fields.items())[:50]
+    }
+    return RawEvent(
+        ts_ms=ev.ts_ms,
+        text=truncate(redact_sensitive_text(ev.text), max_text_chars),
+        fields=fields,
+    )
 
 
 def group_signatures(
@@ -152,11 +186,23 @@ def cap_events(
         if len(kept) >= limit:
             reason = f"limited to {limit} events"
             break
-        text = truncate(ev.text, max_text_chars)
-        size = len(text.encode("utf-8")) + 64
+        safe = sanitize_event(ev, max_text_chars=max_text_chars)
+        event_time = datetime.fromtimestamp(safe.ts_ms / 1000, tz=UTC).isoformat(timespec="seconds")
+        size = len(
+            json.dumps(
+                {
+                    "time": event_time,
+                    "host": safe.host,
+                    "text": safe.text,
+                    "fields": safe.fields,
+                },
+                ensure_ascii=False,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        )
         if used + size > max_bytes:
             reason = f"byte budget of {max_bytes} reached"
             break
         used += size
-        kept.append(RawEvent(ev.ts_ms, text, ev.fields))
+        kept.append(safe)
     return kept, reason
