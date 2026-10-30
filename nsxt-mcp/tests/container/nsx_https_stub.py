@@ -52,6 +52,7 @@ class Handler(BaseHTTPRequestHandler):
 
 if __name__ == "__main__":
     context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    context.minimum_version = ssl.TLSVersion.TLSv1_2
     context.load_cert_chain("/config/server.crt", "/config/server.key")
     server = ThreadingHTTPServer(("0.0.0.0", 8443), Handler)
     server.socket = context.wrap_socket(server.socket, server_side=True)
