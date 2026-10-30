@@ -35,14 +35,16 @@ class Settings(BaseSettings):
     provider: Literal["Local", "ActiveDirectory", "vIDM"] = "ActiveDirectory"
     verify_ssl: bool = True
     ca_bundle: str | None = None
-    # Off by default: VRLI is reached directly, and an HTTP proxy must not intercept it.
+    # Off by default: VRLI is reached directly, and a corporate proxy must not intercept it.
     trust_env: bool = False
 
     # --- resilience --------------------------------------------------------
-    # The HTTP timeout must outlast the VRLI query timeout, or slow queries are cut off
-    # client-side (and retried) while the appliance is still working on them.
     request_timeout_s: float = Field(45.0, gt=0)
+    # VRLI's own query timeout: when it expires VRLI answers with a partial result
+    # (complete=false). The HTTP read timeout for queries is this plus the margin, so the
+    # partial answer arrives before httpx gives up.
     query_timeout_ms: int = Field(30_000, ge=1_000)
+    query_timeout_margin_s: float = Field(15.0, ge=1.0)
     max_concurrency: int = Field(4, ge=1, le=64)
     retries: int = Field(3, ge=0, le=10)
     backoff_base_s: float = Field(0.5, ge=0)
@@ -210,6 +212,10 @@ class Settings(BaseSettings):
                 "http_auth_mode=ldap without ldap_group_role_map requires default_role, "
                 "which is then granted to every user who can bind; set it deliberately"
             )
+
+    @property
+    def query_read_timeout_s(self) -> float:
+        return self.query_timeout_ms / 1000 + self.query_timeout_margin_s
 
     @property
     def base_url(self) -> str:

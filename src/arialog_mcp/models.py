@@ -62,6 +62,9 @@ class Bin(BaseModel):
     count: int
     zscore: float | None = None
     spike: bool = False
+    partial: bool = Field(
+        default=False, description="Bin extends past the window edge; excluded from z-scores"
+    )
 
 
 class AggregateResult(BaseModel):

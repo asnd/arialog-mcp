@@ -4,6 +4,7 @@ from arialog_mcp.reduce import (
     group_signatures,
     mask,
     sanitize_event,
+    time_bins,
     zscores,
 )
 
@@ -51,6 +52,26 @@ def test_cap_events_by_count_bytes_and_line_length():
     assert len(kept) < 10 and "byte budget" in (why or "")
     kept, why = cap_events(evs[:2], limit=10, max_bytes=10_000, max_text_chars=500)
     assert len(kept) == 2 and why is None
+
+
+def test_time_bins_sorts_fills_gaps_and_marks_partial_edges():
+    # window 1_500..10_500 ms, width 2_000, VRLI bins epoch-aligned, sparse and newest first
+    tb = time_bins([(8_000, 3.0), (2_000, 5.0)], start_ms=1_500, end_ms=10_500, width_ms=2_000)
+    assert [(b.start_ms, b.count, b.partial) for b in tb] == [
+        (0, 0.0, True),
+        (2_000, 5.0, False),
+        (4_000, 0.0, False),
+        (6_000, 0.0, False),
+        (8_000, 3.0, False),
+        (10_000, 0.0, True),
+    ]
+
+
+def test_time_bins_follows_vrli_phase_and_keeps_unexpected_bins():
+    tb = time_bins([(1_500, 1.0), (99_000, 2.0)], start_ms=1_500, end_ms=5_500, width_ms=2_000)
+    assert [b.start_ms for b in tb] == [1_500, 3_500, 99_000]
+    assert [b.partial for b in tb] == [False, False, True]
+    assert time_bins([], start_ms=0, end_ms=4_000, width_ms=2_000)[1].count == 0.0
 
 
 def test_sensitive_credentials_are_redacted_from_event_text_and_fields():

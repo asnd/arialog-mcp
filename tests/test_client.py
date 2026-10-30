@@ -5,11 +5,11 @@ import asyncio
 import httpx
 import pytest
 
-from arialog_mcp.client import VRLIClient
+from arialog_mcp.client import VRLIClient, _parse_event
 from arialog_mcp.errors import AuthError, BreakerOpenError, QueryError, UnavailableError
 from conftest import ANCHOR, FakeClock, Stub, make_settings, no_sleep
 
-HOUR = f"timestamp/%3E%3D%20{ANCHOR - 3_600_000}/timestamp/%3C%20{ANCHOR}"
+HOUR = f"timestamp/%3E%3D{ANCHOR - 3_600_000}/timestamp/%3C{ANCHOR}"
 
 
 def make(stub: Stub, clock: FakeClock, **over) -> VRLIClient:
@@ -74,6 +74,8 @@ async def test_breaker_allows_only_one_half_open_probe(clock: FakeClock):
 
     async def handler(request):
         nonlocal calls
+        if request.url.path == "/api/v2/sessions":
+            return httpx.Response(200, json={"sessionId": "token", "ttl": 100})
         calls += 1
         if calls == 1:
             return httpx.Response(503)
@@ -144,9 +146,9 @@ async def test_connect_error_is_unavailable(clock: FakeClock):
     await c.aclose()
 
 
-async def test_version_needs_no_login(client: VRLIClient, stub: Stub):
+async def test_version_requires_a_session(client: VRLIClient, stub: Stub):
     assert (await client.version())["version"].startswith("8.18")
-    assert (await stub.stats())["login_count"] == 0
+    assert (await stub.stats())["login_count"] == 1
 
 
 async def test_no_timestamp_constraint_only_returns_last_minute(client: VRLIClient):
@@ -188,6 +190,58 @@ async def test_concurrency_is_capped(stub: Stub, clock: FakeClock):
     await c.aclose()
 
 
+async def test_login_timeout_440_triggers_one_relogin(client: VRLIClient, stub: Stub):
+    await client.events(HOUR, limit=1)
+    await stub.faults(timeout_sessions=True)
+    assert (await client.events(HOUR, limit=1)).events
+    assert (await stub.stats())["login_count"] == 2
+
+
+async def test_aggregated_requests_limit_and_sorts_sparse_bins(client: VRLIClient, stub: Stub):
+    result = await client.aggregated(HOUR, bin_width_ms=600_000, limit=10)
+    starts = [bin_.start_ms for bin_ in result.bins]
+    assert starts == sorted(starts) and len(starts) == 6
+    assert not result.limit_reached
+    query = (await stub.stats())["last_query"]
+    assert query["limit"] == "10" and query["timeout"] == "30000"
+
+
+def test_event_fields_resolve_utf16_text_offsets():
+    event = _parse_event(
+        {
+            "timestamp": 1,
+            "text": "🔒 esx-02 vmkernel",
+            "fields": [
+                {"name": "hostname", "startPosition": 3, "length": 6},
+                {"name": "appname", "startPosition": 10, "length": 8},
+            ],
+        }
+    )
+    assert event.fields == {"hostname": "esx-02", "appname": "vmkernel"}
+
+
+async def test_query_read_timeout_is_not_retried(clock: FakeClock):
+    calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        if request.url.path == "/api/v2/sessions":
+            return httpx.Response(200, json={"sessionId": "token", "ttl": 100})
+        calls += 1
+        raise httpx.ReadTimeout("query stalled")
+
+    client = VRLIClient(
+        make_settings(retries=3),
+        transport=httpx.MockTransport(handler),
+        sleep=no_sleep,
+        clock=clock,
+    )
+    with pytest.raises(UnavailableError, match="did not answer in time"):
+        await client.events(HOUR, limit=1)
+    assert calls == 1
+    await client.aclose()
+
+
 def test_backoff_is_jittered_capped_and_honours_retry_after(clock: FakeClock):
     s = make_settings(backoff_base_s=1.0, backoff_max_s=5.0)
     lo = VRLIClient(s, sleep=no_sleep, clock=clock, jitter=lambda: 0.0)
@@ -204,6 +258,8 @@ async def test_retry_after_header_drives_the_wait(clock: FakeClock):
     slept: list[float] = []
 
     def handler(_: httpx.Request) -> httpx.Response:
+        if _.url.path == "/api/v2/sessions":
+            return httpx.Response(200, json={"sessionId": "token", "ttl": 100})
         calls["n"] += 1
         if calls["n"] == 1:
             return httpx.Response(503, headers={"Retry-After": "2"})
@@ -304,4 +360,6 @@ async def test_without_service_account_a_credential_is_mandatory(users_stub: Stu
     with pytest.raises(AuthError, match="no VRLI credentials"):
         await c.events(HOUR, limit=1)
     assert (await users_stub.stats())["request_count"] == 0
-    assert (await c.version())["version"].startswith("8.18")  # unauthenticated probe still works
+    with pytest.raises(AuthError, match="no VRLI credentials"):
+        await c.version()
+    assert (await users_stub.stats())["request_count"] == 0

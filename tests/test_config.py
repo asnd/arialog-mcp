@@ -62,6 +62,13 @@ def test_numeric_bounds(field, val):
         mk(**{field: val})
 
 
+def test_query_read_timeout_outlasts_vrli_query_timeout():
+    s = mk(request_timeout_s=61, query_timeout_ms=60_000, query_timeout_margin_s=20)
+    assert s.query_read_timeout_s == 80
+    with pytest.raises(ValidationError):
+        mk(query_timeout_margin_s=0)
+
+
 def test_non_loopback_http_requires_tls_proxy_ack_and_authentication():
     with pytest.raises(ValidationError, match="http_behind_tls_proxy"):
         mk(transport="http", http_host="0.0.0.0")

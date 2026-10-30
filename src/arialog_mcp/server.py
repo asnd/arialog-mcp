@@ -41,6 +41,7 @@ Read-only access to VMware Aria Operations for Logs (VRLI) 8.18.x.
 Recommended order: log_aggregate (is there a spike, and when?) -> log_signatures (what are the
 dominant message types?) -> log_search (a few raw lines for evidence).
 Always give a time window: last_minutes, or start (+ optional end) as ISO-8601 WITH timezone.
+Text: text_all = every word must occur (any order); text_any = any of these phrases.
 Results are capped; check `complete`, `truncated` and `notes` before trusting counts.
 """
 
@@ -51,11 +52,22 @@ Start = Annotated[
     str | None, Field(description="Window start, ISO-8601 with timezone, e.g. 2026-10-07T12:00:00Z")
 ]
 End = Annotated[str | None, Field(description="Window end (default: now); needs start")]
-TextTerms = Annotated[
+TextAll = Annotated[
     list[str] | None,
     Field(
         max_length=MAX_TEXT_TERMS,
-        description=f"Message must contain ALL of these terms (max {MAX_TEXT_TERMS})",
+        description=(
+            f"Every word of these terms must occur in any order (VRLI HAS; max {MAX_TEXT_TERMS})"
+        ),
+    ),
+]
+TextAny = Annotated[
+    list[str] | None,
+    Field(
+        max_length=MAX_TEXT_TERMS,
+        description=(
+            f"Message contains ANY of these exact phrases (VRLI CONTAINS; max {MAX_TEXT_TERMS})"
+        ),
     ),
 ]
 Filters = Annotated[
@@ -274,7 +286,8 @@ def create_server(
         last_minutes: LastMinutes = None,
         start: Start = None,
         end: End = None,
-        text_contains: TextTerms = None,
+        text_all: TextAll = None,
+        text_any: TextAny = None,
         filters: Filters = None,
         bin_seconds: Annotated[
             int | None, Field(ge=1, description="Bin width; default picks ~60 bins")
@@ -285,7 +298,8 @@ def create_server(
             last_minutes=last_minutes,
             start=start,
             end=end,
-            text_contains=text_contains,
+            text_all=text_all,
+            text_any=text_any,
             filters=filters,
             bin_seconds=bin_seconds,
         )
@@ -296,7 +310,8 @@ def create_server(
         last_minutes: LastMinutes = None,
         start: Start = None,
         end: End = None,
-        text_contains: TextTerms = None,
+        text_all: TextAll = None,
+        text_any: TextAny = None,
         filters: Filters = None,
         top_n: Annotated[int, Field(ge=1, le=50)] = 15,
         samples_per_signature: Annotated[int, Field(ge=0, le=3)] = 2,
@@ -306,7 +321,8 @@ def create_server(
             last_minutes=last_minutes,
             start=start,
             end=end,
-            text_contains=text_contains,
+            text_all=text_all,
+            text_any=text_any,
             filters=filters,
             top_n=top_n,
             samples_per_signature=samples_per_signature,
@@ -318,7 +334,8 @@ def create_server(
         last_minutes: LastMinutes = None,
         start: Start = None,
         end: End = None,
-        text_contains: TextTerms = None,
+        text_all: TextAll = None,
+        text_any: TextAny = None,
         filters: Filters = None,
         limit: Annotated[
             int, Field(ge=1, le=1000, description="Max events (server cap applies)")
@@ -329,7 +346,8 @@ def create_server(
             last_minutes=last_minutes,
             start=start,
             end=end,
-            text_contains=text_contains,
+            text_all=text_all,
+            text_any=text_any,
             filters=filters,
             limit=limit,
         )

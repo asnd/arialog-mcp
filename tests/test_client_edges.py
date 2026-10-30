@@ -138,7 +138,7 @@ async def test_events_unexpected_shape(clock, body):
 async def test_aggregated_unexpected_shape(clock, body):
     c = build(clock, with_login(lambda r: httpx.Response(200, json=body)), retries=0)
     with pytest.raises(UnavailableError, match="unexpected shape"):
-        await c.aggregated(PATH, bin_width_ms=1000)
+        await c.aggregated(PATH, bin_width_ms=1000, limit=10)
     await c.aclose()
 
 
@@ -176,7 +176,7 @@ async def test_query_error_detail_json_and_plain(clock):
 
 
 async def test_version_non_dict_payload(clock):
-    c = build(clock, lambda r: httpx.Response(200, json=["8.18"]))
+    c = build(clock, with_login(lambda r: httpx.Response(200, json=["8.18"])))
     assert await c.version() == {"raw": ["8.18"]}
     await c.aclose()
 
@@ -196,4 +196,30 @@ async def test_request_carries_bearer_and_constraint_path_is_not_double_encoded(
         b"/api/v2/events/timestamp/LAST%2060000/text/CONTAINS%20a%2Fb?"
     )
     assert req.url.params["limit"] == "7" and req.url.params["order-by-direction"] == "DESC"
+    await c.aclose()
+
+
+async def test_event_fields_given_as_text_offsets(clock):
+    text = "\U0001f600 esx-02 vmkernel: x"  # emoji = 2 UTF-16 code units, as in Java
+    body = {
+        "events": [
+            {
+                "timestamp": 5,
+                "text": text,
+                "fields": [
+                    {"name": "hostname", "startPosition": 3, "length": 6},
+                    {"name": "appname", "startPosition": 10, "length": 8},
+                    {"name": "source", "content": "10.0.0.12"},
+                    {"name": "outside", "startPosition": 40, "length": 3},
+                    {"name": "negative", "startPosition": -1, "length": 3},
+                    {"name": "nothing"},
+                    "not-a-dict",
+                ],
+            }
+        ]
+    }
+    c = build(clock, with_login(lambda r: httpx.Response(200, json=body)))
+    ev = (await c.events(PATH, limit=1)).events[0]
+    assert ev.fields == {"hostname": "esx-02", "appname": "vmkernel", "source": "10.0.0.12"}
+    assert ev.host == "esx-02"
     await c.aclose()

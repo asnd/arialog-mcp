@@ -62,9 +62,11 @@ async def test_aggregate_bin_width_never_exceeds_cap(make_mcp):
 async def test_signatures_group_and_rank(make_mcp):
     r = await call(make_mcp(), "log_signatures", WINDOW)
     top, second = r["signatures"][0], r["signatures"][1]
-    assert top["template"].startswith("ScsiDeviceIO") and top["count"] == 1200
+    assert top["template"].startswith("esx-<N> vmkernel: ScsiDeviceIO") and top["count"] == 1200
     assert top["top_hosts"] == {"esx-02": 1200} and len(top["samples"]) == 2
-    assert second["template"].startswith("Accepted password") and second["count"] == 360
+    assert (
+        second["template"].startswith("esx-<N> Hostd: Accepted password") and second["count"] == 360
+    )
     assert r["distinct_signatures"] == 3 and r["scanned"] == 1564 and not r["scan_truncated"]
     assert r["signatures"][2]["count"] == 4  # four VMFS ids collapse into one template
 
@@ -82,7 +84,7 @@ async def test_search_filters_and_orders_newest_first(make_mcp):
         "log_search",
         {
             **WINDOW,
-            "text_contains": ["Lost access"],
+            "text_any": ["Lost access"],
             "filters": [{"field": "hostname", "op": "=", "value": "esx-02"}],
             "limit": 10,
         },
@@ -109,7 +111,7 @@ async def test_relative_window(make_mcp):
 
 
 async def test_text_term_cannot_escape_into_other_constraints(make_mcp):
-    r = await call(make_mcp(), "log_search", {**WINDOW, "text_contains": ["x/timestamp/LAST 1"]})
+    r = await call(make_mcp(), "log_search", {**WINDOW, "text_all": ["x/timestamp/LAST 1"]})
     assert r["returned"] == 0  # no 400, no widened window
 
 
@@ -169,7 +171,7 @@ async def test_audit_log_records_calls_without_secrets(make_mcp, caplog):
     await call(
         make_mcp(),
         "log_search",
-        {**WINDOW, "limit": 1, "text_contains": ["audit-secret-value"]},
+        {**WINDOW, "limit": 1, "text_any": ["audit-secret-value"]},
     )
     with pytest.raises(ToolError):
         await call(make_mcp(), "log_search", {"start": "2026-10-07T10:00:00"})
@@ -280,7 +282,7 @@ async def test_search_and_signature_outputs_redact_sensitive_log_content(make_mc
 
 async def test_too_many_text_terms_rejected_by_schema(make_mcp):
     with pytest.raises(ToolError):
-        await call(make_mcp(), "log_search", {**WINDOW, "text_contains": ["a"] * 11})
+        await call(make_mcp(), "log_search", {**WINDOW, "text_all": ["a"] * 11})
 
 
 async def test_readyz_reflects_breaker_without_touching_vrli(make_mcp, stub: Stub):
@@ -341,3 +343,63 @@ async def test_http_tool_calls_are_rate_limited_per_authenticated_caller(make_mc
     assert not first.json()["result"].get("isError")
     assert second.json()["result"]["isError"]
     assert "request budget" in second.json()["result"]["content"][0]["text"]
+
+
+async def test_text_all_and_text_any_have_distinct_semantics(make_mcp):
+    all_terms = await call(
+        make_mcp(), "log_search", {**WINDOW, "text_all": ["volume", "lost"], "limit": 10}
+    )
+    assert all_terms["returned"] == 4
+    none = await call(
+        make_mcp(), "log_search", {**WINDOW, "text_all": ["volume", "SCSI"], "limit": 10}
+    )
+    assert none["returned"] == 0
+    any_phrases = await call(
+        make_mcp(),
+        "log_signatures",
+        {**WINDOW, "text_any": ["Lost access", "Accepted password"]},
+    )
+    assert any_phrases["scanned"] == 364
+
+
+async def test_search_resolves_hostname_and_appname_text_offsets(make_mcp):
+    result = await call(
+        make_mcp(), "log_search", {**WINDOW, "text_any": ["Lost access"], "limit": 1}
+    )
+    event = result["events"][0]
+    assert event["host"] == "esx-02" and event["fields"]["appname"] == "vmkernel"
+    assert event["fields"]["source"] == "10.0.0.12"
+
+
+async def test_aggregate_zero_fills_sparse_bins_and_marks_partial_edges(make_mcp):
+    result = await call(
+        make_mcp(), "log_aggregate", {**WINDOW, "text_any": ["ScsiDeviceIO"], "bin_seconds": 300}
+    )
+    bins = result["bins"]
+    assert len(bins) == 24
+    assert sum(bin_["count"] == 0 for bin_ in bins) == 23
+    assert result["total"] == 1200
+
+
+async def test_unaligned_aggregate_stays_within_cap_and_marks_edges(make_mcp):
+    result = await call(
+        make_mcp(max_bins=24),
+        "log_aggregate",
+        {"start": "2026-10-07T10:00:07Z", "end": "2026-10-07T12:00:07Z"},
+    )
+    assert len(result["bins"]) <= 24
+    assert result["bins"][0]["partial"] and result["bins"][-1]["partial"]
+
+
+async def test_regex_error_explains_appliance_configuration(make_mcp):
+    with pytest.raises(ToolError, match="regex-query-enabled"):
+        await call(
+            make_mcp(),
+            "log_search",
+            {**WINDOW, "filters": [{"field": "text", "op": "=~", "value": "Lost.*"}]},
+        )
+
+
+async def test_version_logs_in(make_mcp, stub: Stub):
+    await call(make_mcp(), "version", {})
+    assert (await stub.stats())["login_count"] == 1

@@ -35,8 +35,10 @@ from .reduce import RawEvent
 log = logging.getLogger("arialog_mcp.client")
 
 RETRY_STATUS = {429, 502, 503, 504}
+SESSION_EXPIRED = {401, 440}
 SESSION_REFRESH_FRACTION = 0.9
 DEFAULT_SESSION_TTL_S = 1800
+MAX_RETRY_AFTER_S = 30.0
 
 
 @dataclass
@@ -56,6 +58,7 @@ class RawBin:
 class RawBins:
     bins: list[RawBin]
     complete: bool
+    limit_reached: bool = False
 
 
 @dataclass(frozen=True)
@@ -144,6 +147,9 @@ class VRLIClient:
             verify=verify,
             trust_env=settings.trust_env,
             transport=transport,
+        )
+        self._query_timeout = httpx.Timeout(
+            settings.request_timeout_s, read=settings.query_read_timeout_s
         )
         self._sem = asyncio.Semaphore(settings.max_concurrency)
         self._breaker = CircuitBreaker(
@@ -273,6 +279,7 @@ class VRLIClient:
         *,
         auth: bool = True,
         creds: Credentials | None = None,
+        query: bool = False,
     ) -> Any:
         sess = self._session(creds) if auth else None  # fail closed before any I/O
         await self._breaker.before()
@@ -286,13 +293,17 @@ class VRLIClient:
                 headers = {"Authorization": f"Bearer {token}"} if token else {}
                 async with self._sem:
                     code, response_headers, content = await self._request(
-                        "GET", path, params=params, headers=headers
+                        "GET",
+                        path,
+                        params=params,
+                        headers=headers,
+                        timeout=(self._query_timeout if query else httpx.USE_CLIENT_DEFAULT),
                     )
-                if code == 401 and sess and token and not relogged:
+                if code in SESSION_EXPIRED and sess and token and not relogged:
                     self._invalidate(sess, token)
                     relogged = True
                     continue
-                if code in (401, 403):
+                if code in SESSION_EXPIRED or code == 403:
                     raise AuthError(f"VRLI refused the session (HTTP {code})")
                 if code in RETRY_STATUS or code >= 500:
                     retry_after = _retry_after(response_headers)
@@ -311,6 +322,13 @@ class VRLIClient:
                 raise
             except UnavailableError as exc:  # includes a 503 during login (appliance starting)
                 last = exc
+            except httpx.ReadTimeout as exc:
+                # The appliance returns a partial result at its own query timeout; do not resend
+                # the same expensive query if it fails to respond even after the margin.
+                self._breaker.failure()
+                raise UnavailableError(
+                    "VRLI did not answer in time (ReadTimeout); narrow the window or add filters"
+                ) from exc
             except httpx.HTTPError as exc:
                 last = UnavailableError(f"VRLI unavailable: request failed ({type(exc).__name__})")
             except BaseException:
@@ -339,8 +357,8 @@ class VRLIClient:
             return response.status_code, response.headers, bytes(content)
 
     # ------------------------------------------------------------------ API
-    async def version(self) -> dict[str, Any]:
-        data = await self._get("/api/v1/version", auth=False)
+    async def version(self, *, creds: Credentials | None = None) -> dict[str, Any]:
+        data = await self._get("/api/v2/version", creds=creds)
         return data if isinstance(data, dict) else {"raw": data}
 
     async def events(
@@ -354,6 +372,7 @@ class VRLIClient:
                 "order-by-direction": "DESC",
             },
             creds=creds,
+            query=True,
         )
         try:
             events = [
@@ -369,23 +388,36 @@ class VRLIClient:
             raise UnavailableError("VRLI events response had an unexpected shape") from exc
 
     async def aggregated(
-        self, constraints: str, *, bin_width_ms: int, creds: Credentials | None = None
+        self,
+        constraints: str,
+        *,
+        bin_width_ms: int,
+        limit: int = 100,
+        creds: Credentials | None = None,
     ) -> RawBins:
         data = await self._get(
             f"/api/v2/aggregated-events/{constraints}",
             {
                 "bin-width": bin_width_ms,
                 "aggregation-function": "COUNT",
+                "limit": limit,
                 "timeout": self._s.query_timeout_ms,
             },
             creds=creds,
+            query=True,
         )
         try:
+            raw = data.get("bins", [])
             bins = [
                 RawBin(int(b["minTimestamp"]), int(b["maxTimestamp"]), float(b.get("value", 0)))
-                for b in data.get("bins", [])
+                for b in raw
             ]
-            return RawBins(bins=bins, complete=bool(data.get("complete", True)))
+            bins.sort(key=lambda bin_: bin_.start_ms)
+            return RawBins(
+                bins=bins,
+                complete=bool(data.get("complete", True)),
+                limit_reached=len(raw) >= limit,
+            )
         except (AttributeError, KeyError, TypeError, ValueError) as exc:
             raise UnavailableError(
                 "VRLI aggregated-events response had an unexpected shape"
@@ -395,19 +427,30 @@ class VRLIClient:
 def _parse_event(
     raw: dict[str, Any], *, max_fields: int = 50, max_field_chars: int = 500
 ) -> RawEvent:
+    text = str(raw.get("text", ""))
     fields: dict[str, str] = {}
     for f in (raw.get("fields", []) or [])[:max_fields]:
+        if not isinstance(f, dict):
+            continue
         name = f.get("name")
         if name and name not in fields:
-            fields[str(name)[:128]] = str(f.get("content", ""))[:max_field_chars]
-    return RawEvent(ts_ms=int(raw["timestamp"]), text=str(raw.get("text", "")), fields=fields)
+            value = f.get("content")
+            if value is None:
+                start, length = f.get("startPosition"), f.get("length")
+                if type(start) is int and type(length) is int and start >= 0 and length >= 0:
+                    units = text.encode("utf-16-le")[2 * start : 2 * (start + length)]
+                    if len(units) == 2 * length:
+                        value = units.decode("utf-16-le", errors="replace")
+            if value is not None:
+                fields[str(name)[:128]] = str(value)[:max_field_chars]
+    return RawEvent(ts_ms=int(raw["timestamp"]), text=text, fields=fields)
 
 
 def _retry_after(headers: httpx.Headers) -> float | None:
     """Retry-After in seconds (delta form only; HTTP-date is ignored)."""
     raw = headers.get("retry-after", "").strip()
     try:
-        return max(0.0, float(raw)) if raw else None
+        return min(MAX_RETRY_AFTER_S, max(0.0, float(raw))) if raw else None
     except ValueError:
         return None
 
